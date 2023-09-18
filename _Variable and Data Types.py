@@ -1,4 +1,3 @@
-# day-6 
 a=11111
 print(a)
 print("a")
