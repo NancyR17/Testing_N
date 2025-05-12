@@ -1,0 +1,17 @@
+# === Cleanup Step: Delete Old Unused Images ===
+echo "🔍 Cleaning up unused container images..."
+
+# Get all images, sorted by creation time (latest first), and currently used images
+all_images=$(crictl images --output=json | jq -r '.images | sort_by(.createdAt) | reverse | .[].id')
+used_images=$(crictl ps -q | xargs -r crictl inspect | jq -r '.[].info.runtimeSpec.image')
+
+# Keep the latest 2 images
+safe_images=$(echo -e "$used_images\n$(echo "$all_images" | head -n 2)" | sort | uniq)
+
+# Delete unused images
+for image in $all_images; do
+  if ! echo "$safe_images" | grep -q "$image"; then
+    echo "🗑️ Deleting unused image: $image"
+    crictl rmi "$image"
+  fi
+done
