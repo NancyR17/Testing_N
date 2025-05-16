@@ -1,0 +1,67 @@
+import requests
+import datetime
+import csv
+
+# ==== CONFIGURATION ====
+LOKI_URL = "http://localhost:60529/loki/api/v1/query_range"
+POD_PREFIX = "singoore-notifications-engune"  # Use prefix to match changing pod names
+MATCH_TEXT = "Notification engine started"
+OUTPUT_CSV = "notification_engine_log_summary.csv"
+
+# ==== TIME RANGE ====
+now = datetime.datetime.utcnow()
+start_time = now - datetime.timedelta(hours=24)
+start_ns = int(start_time.timestamp() * 1e9)
+end_ns = int(now.timestamp() * 1e9)
+
+# ==== STEP 1: Find matching pods ====
+label_query_url = "http://localhost:60529/loki/api/v1/label/pod/values"
+pod_list = requests.get(label_query_url).json().get("data", [])
+matching_pods = [pod for pod in pod_list if POD_PREFIX in pod]
+
+if not matching_pods:
+    print(f"No pods found with prefix '{POD_PREFIX}'")
+    exit(1)
+
+print(f"Found matching pods: {matching_pods}")
+
+# ==== STEP 2: Query logs for each matching pod ====
+run_times = []
+
+for pod in matching_pods:
+    query = f'{{pod="{pod}"}} |= "{MATCH_TEXT}"'
+    print(f"\nQuerying logs for pod: {pod}")
+
+    response = requests.get(
+        LOKI_URL,
+        params={
+            "query": query,
+            "start": start_ns,
+            "end": end_ns,
+            "limit": 10000,
+            "direction": "forward"
+        }
+    )
+
+    if response.status_code != 200:
+        print(f"Error fetching logs for pod {pod}: {response.status_code}, {response.text}")
+        continue
+
+    entries = response.json().get("data", {}).get("result", [])
+    for result in entries:
+        for value in result["values"]:
+            timestamp_ns = int(value[0])
+            ts = datetime.datetime.utcfromtimestamp(timestamp_ns / 1e9)
+            run_times.append(ts.strftime("%Y-%m-%d %H:%M:%S UTC"))
+
+# ==== OUTPUT ====
+print(f"\nTotal logs found: {len(run_times)}")
+
+# Save to CSV
+with open(OUTPUT_CSV, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["Run Timestamp"])
+    for ts in run_times:
+        writer.writerow([ts])
+
+print(f"Saved logs to {OUTPUT_CSV}")
