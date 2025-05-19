@@ -1,12 +1,14 @@
+
 import requests
 import datetime
 import csv
 
 # ==== CONFIGURATION ====
-LOKI_URL = "http://localhost:60529/loki/api/v1/query_range"
-POD_PREFIX = "singoore-notifications-engune"  # Use prefix to match changing pod names
-MATCH_TEXT = "Notification engine started"
+LOKI_URL = "http://localhost:port/loki/api/v1/query_range"  # Replace '3100' with your actual Loki port if different
+POD_PREFIX = "mercury-notification-engine"  # Use prefix to match changing pod names
+MATCH_TEXT = "Starting Notification Engine Job Scheduler"
 OUTPUT_CSV = "notification_engine_log_summary.csv"
+MAX_ENTRIES_LIMIT = 5000  # Set to the server's max limit
 
 # ==== TIME RANGE ====
 now = datetime.datetime.utcnow()
@@ -15,8 +17,18 @@ start_ns = int(start_time.timestamp() * 1e9)
 end_ns = int(now.timestamp() * 1e9)
 
 # ==== STEP 1: Find matching pods ====
-label_query_url = "http://localhost:60529/loki/api/v1/label/pod/values"
-pod_list = requests.get(label_query_url).json().get("data", [])
+label_query_url = "http://localhost:port/loki/api/v1/label/pod/values"  # Replace '3100' with your actual Loki port if different
+response = requests.get(label_query_url)
+if response.status_code != 200:
+    print(f"Failed to fetch pod labels: {response.status_code}, {response.text}")
+    exit(1)
+
+try:
+    pod_list = response.json().get("data", [])
+except ValueError:
+    print("Failed to parse JSON response from Loki.")
+    exit(1)
+
 matching_pods = [pod for pod in pod_list if POD_PREFIX in pod]
 
 if not matching_pods:
@@ -28,34 +40,50 @@ print(f"Found matching pods: {matching_pods}")
 # ==== STEP 2: Query logs for each matching pod ====
 run_times = []
 
+
 for pod in matching_pods:
     query = f'{{pod="{pod}"}} |= "{MATCH_TEXT}"'
     print(f"\nQuerying logs for pod: {pod}")
 
-    response = requests.get(
-        LOKI_URL,
-        params={
-            "query": query,
-            "start": start_ns,
-            "end": end_ns,
-            "limit": 10000,
-            "direction": "forward"
-        }
-    )
+    current_start_ns = start_ns
+    # Add your log querying logic here
 
-    if response.status_code != 200:
-        print(f"Error fetching logs for pod {pod}: {response.status_code}, {response.text}")
-        continue
+    while True:
+        response = requests.get(
+            LOKI_URL,
+            params={
+                "query": query,
+                "start": current_start_ns,
+                "end": end_ns,
+                "limit": MAX_ENTRIES_LIMIT,
+                "direction": "forward"
+            }
+        )
 
-    entries = response.json().get("data", {}).get("result", [])
-    for result in entries:
-        for value in result["values"]:
-            timestamp_ns = int(value[0])
-            ts = datetime.datetime.utcfromtimestamp(timestamp_ns / 1e9)
-            run_times.append(ts.strftime("%Y-%m-%d %H:%M:%S UTC"))
+        if response.status_code != 200:
+            print(f"Error fetching logs for pod {pod}: {response.status_code}, {response.text}")
+            break
+
+        entries = response.json().get("data", {}).get("result", [])
+        if not entries:
+            break
+
+        for result in entries:
+            for value in result["values"]:
+                timestamp_ns = int(value[0])
+                ts = datetime.datetime.fromtimestamp(timestamp_ns / 1e9, datetime.UTC)
+                run_times.append(ts.strftime("%Y-%m-%d %H:%M:%S UTC"))
+
+        # Update the start time for the next query to the last timestamp + 1 nanosecond
+        last_timestamp_ns = int(entries[-1]["values"][-1][0])
+        current_start_ns = last_timestamp_ns + 1
 
 # ==== OUTPUT ====
 print(f"\nTotal logs found: {len(run_times)}")
+
+# Sort timestamps
+run_times.sort()
+
 
 # Save to CSV
 with open(OUTPUT_CSV, "w", newline="") as f:
@@ -64,4 +92,13 @@ with open(OUTPUT_CSV, "w", newline="") as f:
     for ts in run_times:
         writer.writerow([ts])
 
-print(f"Saved logs to {OUTPUT_CSV}")
+print(f"\nSaved {len(run_times)} log entries to {OUTPUT_CSV}")
+
+
+# Compare with expected number of runs
+expected_runs = 96
+actual_runs = len(run_times)
+print(f"Expected runs in 24 hours: {expected_runs}")
+print(f"Actual runs found: {actual_runs}")
+print(f"Missed runs: {expected_runs - actual_runs}")
+
