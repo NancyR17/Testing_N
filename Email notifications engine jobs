@@ -1,0 +1,129 @@
+import requests
+import datetime
+import csv
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# ==== CONFIGURATION ====
+LOKI_URL = "http://localhost:3100/loki/api/v1/query_range"
+POD_PREFIX = "notification-engine"
+MATCH_TEXT = "Starting Notification Engine Job Scheduler"
+OUTPUT_CSV = "notification_engine_log_summary.csv"
+MAX_ENTRIES_LIMIT = 5000
+EMAIL_ALERTS_ENABLED = True
+
+# ==== EMAIL CONFIGURATION ====
+SMTP_SERVER = "SMTP.auth.producta.singapore"
+SMTP_PORT = 25
+SENDER = "singaporenotifyalerts_dev@products.singapore"
+RECIPIENTS = ["your_email@example.com"]  # Can be a list
+SUBJECT_MISSED = "Notification Engine Missed Run Alert"
+SUBJECT_SUCCESS = "Notification Engine All Runs Successful"
+
+def send_email(subject, body):
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = SENDER
+    msg["To"] = ", ".join(RECIPIENTS)
+
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.sendmail(SENDER, RECIPIENTS, msg.as_string())
+        print("Email sent successfully.")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
+# ==== FIXED TIME RANGE ====
+now = datetime.datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+end_time = now.replace(hour=11)
+start_time = end_time - datetime.timedelta(days=1)
+start_ns = int(start_time.timestamp() * 1e9)
+end_ns = int(end_time.timestamp() * 1e9)
+
+# ==== STEP 1: Get Matching Pods ====
+label_query_url = "http://localhost:3100/loki/api/v1/label/pod/values"
+response = requests.get(label_query_url)
+
+if response.status_code != 200:
+    print(f"Failed to fetch pod labels: {response.status_code}, {response.text}")
+    exit(1)
+
+try:
+    pod_list = response.json().get("data", [])
+except ValueError:
+    print("Failed to parse JSON from Loki.")
+    exit(1)
+
+matching_pods = [pod for pod in pod_list if POD_PREFIX in pod]
+if not matching_pods:
+    print(f"No pods found with prefix '{POD_PREFIX}'")
+    exit(1)
+
+print(f"Found matching pods: {matching_pods}")
+
+# ==== STEP 2: Query Logs ====
+run_times = []
+
+for pod in matching_pods:
+    query = f'{{pod="{pod}"}} |= "{MATCH_TEXT}"'
+    print(f"\nQuerying logs for pod: {pod}")
+    current_start_ns = start_ns
+
+    while True:
+        response = requests.get(
+            LOKI_URL,
+            params={
+                "query": query,
+                "start": current_start_ns,
+                "end": end_ns,
+                "limit": MAX_ENTRIES_LIMIT,
+                "direction": "forward"
+            }
+        )
+
+        if response.status_code != 200:
+            print(f"Error fetching logs for pod {pod}: {response.status_code}, {response.text}")
+            break
+
+        entries = response.json().get("data", {}).get("result", [])
+        if not entries:
+            break
+
+        for result in entries:
+            for value in result["values"]:
+                timestamp_ns = int(value[0])
+                ts = datetime.datetime.fromtimestamp(timestamp_ns / 1e9, datetime.timezone.utc)
+                run_times.append(ts.replace(second=0, microsecond=0))
+
+        last_timestamp_ns = int(entries[-1]["values"][-1][0])
+        current_start_ns = last_timestamp_ns + 1
+
+# ==== STEP 3: Analyze & Save ====
+run_times = sorted(set(run_times))
+print(f"\nTotal logs found: {len(run_times)}")
+
+# Save to CSV
+with open(OUTPUT_CSV, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["Run Timestamp (UTC)"])
+    for ts in run_times:
+        writer.writerow([ts.strftime("%Y-%m-%d %H:%M")])
+
+print(f"Saved to {OUTPUT_CSV}")
+
+# ==== STEP 4: Detect Missed Runs ====
+expected_times = [start_time + datetime.timedelta(minutes=15 * i) for i in range(96)]
+missed = [ts for ts in expected_times if ts.replace(second=0, microsecond=0) not in run_times]
+
+# ==== STEP 5: Email Notification (Always) ====
+if EMAIL_ALERTS_ENABLED:
+    if missed:
+        subject = SUBJECT_MISSED
+        body = f"The following {len(missed)} 15-minute runs were missed:\n\n"
+        body += "\n".join(ts.strftime('%Y-%m-%d %H:%M UTC') for ts in missed)
+    else:
+        subject = SUBJECT_SUCCESS
+        body = f"All {len(expected_times)} runs detected successfully. No runs missed."
+
+    send_email(subject, body)
