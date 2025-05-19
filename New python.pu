@@ -1,0 +1,130 @@
+import subprocess
+from datetime import datetime, timedelta
+import smtplib
+import csv
+import os
+
+# CONFIGURATION
+namespace = "monitoring"
+label_selector = "app=mercury-notification-job"
+smtp_server = "your.smtp.server.com"
+sender = "alerts@yourdomain.com"
+receiver = "you@yourdomain.com"
+
+def get_latest_pod():
+    cmd = [
+        "kubectl", "get", "pods", "-n", namespace,
+        "-l", label_selector,
+        "--sort-by=.metadata.creationTimestamp",
+        "-o", "jsonpath={.items[-1].metadata.name}"
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        return result.stdout.strip()
+    else:
+        raise Exception("Could not fetch pod: " + result.stderr)
+
+def get_logs(pod_name):
+    # Fetch logs only from last 17 minutes to avoid duplicates and keep buffer
+    cmd = ["kubectl", "logs", pod_name, "-n", namespace, "--since=17m"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        return result.stdout
+    else:
+        raise Exception("Could not fetch logs: " + result.stderr)
+
+def send_email(subject, body):
+    message = f"From: {sender}\nTo: {receiver}\nSubject: {subject}\n\n{body}"
+    try:
+        with smtplib.SMTP(smtp_server, 25, timeout=10) as server:
+            server.sendmail(sender, [receiver], message)
+        print("✅ Email sent.")
+    except Exception as e:
+        print("❌ Failed to send email:", str(e))
+
+def analyze_logs(log_data):
+    lines = log_data.splitlines()
+    times = []
+    for line in lines:
+        if "Notification Engine Job Scheduler next run date:" in line:
+            try:
+                time_str = line.strip().split("next run date:")[1].strip()
+                next_run = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+                times.append(next_run)
+            except Exception as e:
+                print(f"Failed to parse time from line: {line}\nError: {e}")
+
+    times = sorted(set(times))  # unique and sorted
+
+    if not times:
+        return [], [], 0, 0, "⚠️ No valid 'next run' timestamps found in logs."
+
+    # Build expected time slots (15 min interval) between earliest and latest timestamp
+    expected_times = []
+    current = times[0]
+    end = times[-1]
+    while current <= end:
+        expected_times.append(current)
+        current += timedelta(minutes=15)
+
+    actual_set = set(times)
+    missing = [t for t in expected_times if t not in actual_set]
+
+    return expected_times, missing, len(expected_times), len(times), None
+
+def write_csv(expected, missing):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"/tmp/notification_run_report_{timestamp}.csv"
+    with open(filename, mode="w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Scheduled Timestamp", "Status"])
+        for t in expected:
+            status = "✅ Found" if t not in missing else "❌ Missing"
+            writer.writerow([t.strftime("%Y-%m-%d %H:%M:%S"), status])
+    return filename
+
+def main():
+    try:
+        pod = get_latest_pod()
+        print("🔍 Using pod:", pod)
+        logs = get_logs(pod)
+        expected, missing, total_expected, actual_found, error = analyze_logs(logs)
+
+        if error:
+            print(error)
+            send_email("⚠️ Script Log Error", error)
+            return
+
+        # Summary
+        print("\n📊 Summary:")
+        print(f"🕒 Total expected runs      : {total_expected}")
+        print(f"✅ Actual runs found       : {actual_found}")
+        print(f"❌ Missing scheduled runs  : {len(missing)}")
+
+        # Detailed print
+        if missing:
+            print("\n❗ Missing Run Timestamps:")
+            for t in missing:
+                print(" -", t.strftime("%Y-%m-%d %H:%M:%S"))
+        else:
+            print("\n✅ All 15-min intervals successfully recorded.")
+
+        # Write CSV
+        csv_path = write_csv(expected, missing)
+        print(f"\n📄 CSV report written to: {csv_path}")
+
+        # Send email
+        if missing:
+            body = "❌ Some Notification Engine job runs were missed:\n\n"
+            body += "\n".join([t.strftime("%Y-%m-%d %H:%M:%S") for t in missing])
+            send_email("🚨 Notification Run Missing", body)
+        else:
+            send_email("✅ Notification Runs Successful", f"All {total_expected} scheduled runs completed successfully.")
+
+    except Exception as e:
+        print("❌ Script failed:", str(e))
+        send_email("❌ Script Execution Failed", str(e))
+
+if __name__ == "__main__":
+    main()
+    
