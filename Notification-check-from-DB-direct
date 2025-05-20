@@ -1,52 +1,95 @@
-import os
 import psycopg2
 import smtplib
-from email.mime.text import MIMEText
+import os
+from email.message import EmailMessage
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
+import logging
 
+# Load environment variables
 load_dotenv()
 
-conn = psycopg2.connect(
-    dbname=os.getenv("DB_NAME"),
-    user=os.getenv("DB_USER"),
-    password=os.getenv("DB_PASSWORD"),
-    host=os.getenv("DB_HOST"),
-    port=os.getenv("DB_PORT")
-)
-cur = conn.cursor()
+# Logging setup
+os.makedirs("logs", exist_ok=True)
+log_file = os.path.join("logs", f"log_{datetime.now().strftime('%Y-%m-%d')}.log")
+logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(message)s')
 
-cur.execute("""
-    SELECT next_fire_time
-    FROM notification_jobs
-    WHERE next_fire_time::date = CURRENT_DATE
-    ORDER BY next_fire_time ASC;
+# ENV vars
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = os.getenv("DB_PORT")
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT"))
+EMAIL_FROM = os.getenv("EMAIL_FROM")
+EMAIL_TO = os.getenv("EMAIL_TO")
+
+# Function to send mail
+def send_email(gap_minutes, time1, time2):
+    msg = EmailMessage()
+    msg['Subject'] = f"⚠️ Alert: Gap > 15 minutes in next_fire_time"
+    msg['From'] = EMAIL_FROM
+    msg['To'] = EMAIL_TO
+
+    msg.set_content(f"""\
+Next fire time gap detected exceeding 15 minutes.
+
+First Time : {time1}
+Second Time: {time2}
+Gap        : {gap_minutes:.2f} minutes
 """)
-rows = cur.fetchall()
-timestamps = [r[0] for r in rows]
 
-issues = []
-for i in range(1, len(timestamps)):
-    gap = (timestamps[i] - timestamps[i - 1]).total_seconds() / 60
-    if gap != 15:
-        issues.append(f"Issue at {timestamps[i]} → Gap: {round(gap, 2)} mins")
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.send_message(msg)
 
-if issues:
-    body = "Notification schedule gap found:\n\n" + "\n".join(issues)
-    msg = MIMEText(body)
-    msg['Subject'] = "Notification Schedule Gap Detected"
-    msg['From'] = os.getenv("EMAIL_FROM")
-    msg['To'] = os.getenv("EMAIL_TO")
-
+# Fetch and process fire times
+def check_gaps():
     try:
-        with smtplib.SMTP(os.getenv("EMAIL_HOST"), int(os.getenv("EMAIL_PORT"))) as smtp:
-            smtp.send_message(msg)
-        print(f"[{datetime.now()}] Email sent.")
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD
+        )
+        cur = conn.cursor()
+
+        # Get all next_fire_time for last 24 hours
+        cutoff_time = int((datetime.utcnow() - timedelta(hours=24)).timestamp() * 1000)
+
+        cur.execute("""
+            SELECT trigger_name, next_fire_time 
+            FROM "SVC_PHM_OWNER".phm_ntfn_qrtz_triggers 
+            WHERE next_fire_time >= %s
+            ORDER BY next_fire_time ASC
+        """, (cutoff_time,))
+
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        # Convert and check gaps
+        fire_times = []
+        for trigger_name, nft in rows:
+            if nft:
+                dt = datetime.utcfromtimestamp(nft / 1000.0)
+                fire_times.append((trigger_name, dt))
+
+        for i in range(1, len(fire_times)):
+            trigger1, t1 = fire_times[i - 1]
+            trigger2, t2 = fire_times[i]
+            gap = (t2 - t1).total_seconds() / 60.0
+
+            if gap > 15:
+                logging.warning(f"Gap of {gap:.2f} minutes between {t1} and {t2}")
+                send_email(gap, t1, t2)
+            else:
+                logging.info(f"Valid gap ({gap:.2f} mins) between {t1} and {t2}")
+
     except Exception as e:
-        print(f"[{datetime.now()}] Email send failed: {e}")
-else:
-    print(f"[{datetime.now()}] All fire times are spaced 15 minutes apart.")
+        logging.error(f"Error: {str(e)}")
 
-cur.close()
-conn.close()
-
+if __name__ == "__main__":
+    check_gaps()
