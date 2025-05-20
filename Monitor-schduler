@@ -1,0 +1,85 @@
+import os
+import psycopg2
+from datetime import datetime, timedelta
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Email alert function
+def send_email_alert(subject, body):
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = int(os.getenv("SMTP_PORT", 25))
+    email_from = os.getenv("EMAIL_FROM")
+    email_to = os.getenv("EMAIL_TO")
+
+    msg = MIMEMultipart()
+    msg['From'] = email_from
+    msg['To'] = email_to
+    msg['Subject'] = subject
+
+    msg.attach(MIMEText(body, 'plain'))
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.send_message(msg)
+            print("✅ Email sent.")
+    except Exception as e:
+        print(f"❌ Failed to send email: {e}")
+
+# PostgreSQL connection
+conn = psycopg2.connect(
+    host=os.getenv("DB_HOST"),
+    port=os.getenv("DB_PORT"),
+    dbname=os.getenv("DB_NAME"),
+    user=os.getenv("DB_USER"),
+    password=os.getenv("DB_PASSWORD")
+)
+
+cursor = conn.cursor()
+
+# Query to get next_fire_times from last 24 hours
+cursor.execute("""
+    SELECT next_fire_time
+    FROM "SVC_PHM_OWNER".phm_ntfn_qrtz_triggers
+    WHERE to_timestamp(next_fire_time / 1000) >= NOW() - INTERVAL '24 hours'
+    ORDER BY next_fire_time
+""")
+
+rows = cursor.fetchall()
+conn.close()
+
+next_fire_times = [datetime.fromtimestamp(row[0] / 1000) for row in rows]
+
+# Log file setup
+if not os.path.exists("logs"):
+    os.makedirs("logs")
+
+log_filename = f"logs/log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+with open(log_filename, "w") as log_file:
+    log_file.write(f"Total next fire times found: {len(next_fire_times)}\n")
+
+    missed_count = 0
+    for i in range(1, len(next_fire_times)):
+        gap = (next_fire_times[i] - next_fire_times[i - 1]).total_seconds() / 60
+        log_file.write(f"{next_fire_times[i - 1]} --> {next_fire_times[i]} | Gap: {gap:.2f} minutes\n")
+        if gap > 15:
+            missed_count += 1
+            send_email_alert(
+                subject="⛔ Missed Scheduler Alert",
+                body=f"Gap between {next_fire_times[i - 1]} and {next_fire_times[i]} is {gap:.2f} minutes."
+            )
+
+    if missed_count == 0:
+        log_file.write("✅ All next fire times within expected 15-minute gap.\n")
+    else:
+        log_file.write(f"❌ {missed_count} gap(s) found exceeding 15 minutes.\n")
+
+# Final status email
+send_email_alert(
+    subject="Scheduler Monitoring Executed",
+    body=f"Script ran successfully. Found {len(next_fire_times)} next_fire_time entries. Missed gaps: {missed_count}."
+)
