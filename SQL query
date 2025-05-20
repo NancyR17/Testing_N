@@ -20,3 +20,11 @@ SELECT
 FROM "SVC_PHM_OWNER".phm_ntfn_qrtz_triggers
 WHERE to_timestamp(next_fire_time / 1000) >= NOW() - INTERVAL '48 hours'
 ORDER BY fire_ts;
+
+SELECT
+  to_timestamp(next_fire_time / 1000) AS last_fire_ts,
+  NOW() AS current_ts,
+  EXTRACT(EPOCH FROM (NOW() - to_timestamp(next_fire_time / 1000))) / 60 AS minutes_since_last_fire
+FROM "SVC_PHM_OWNER".phm_ntfn_qrtz_triggers
+ORDER BY next_fire_time DESC
+LIMIT 1;
