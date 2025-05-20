@@ -28,3 +28,12 @@ SELECT
 FROM "SVC_PHM_OWNER".phm_ntfn_qrtz_triggers
 ORDER BY next_fire_time DESC
 LIMIT 1;
+
+
+SELECT
+  previous_fire_time,
+  to_timestamp(previous_fire_time / 1000) AS previous_fire_time_ts,
+  next_fire_time,
+  to_timestamp(next_fire_time / 1000) AS next_fire_time_ts
+FROM "SVC_PHM_OWNER".phm_ntfn_qrtz_triggers
+ORDER BY next_fire_time_ts DESC;
