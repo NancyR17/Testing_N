@@ -1,112 +1,96 @@
-import os
 import psycopg2
 import smtplib
-import logging
-import datetime
-from email.mime.text import MIMEText
+from email.message import EmailMessage
+from datetime import datetime, timedelta
+import os
 from dotenv import load_dotenv
+import logging
 
-# Load env vars
+# Load environment variables
 load_dotenv()
 
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = os.getenv("DB_PORT")
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+
+SMTP_HOST = os.getenv("EMAIL_HOST")
+SMTP_PORT = int(os.getenv("EMAIL_PORT", "25"))
+EMAIL_FROM = os.getenv("EMAIL_FROM")
+EMAIL_TO = os.getenv("EMAIL_TO")
+
 # Setup logging
-logging.basicConfig(
-    filename="logs/firetime_check.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log_{datetime.now().strftime('%Y-%m-%d')}.txt")
+logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# DB connection
-conn = psycopg2.connect(
-    host=os.getenv("DB_HOST"),
-    port=os.getenv("DB_PORT"),
-    user=os.getenv("DB_USER"),
-    password=os.getenv("DB_PASSWORD"),
-    dbname=os.getenv("DB_NAME")
-)
-cur = conn.cursor()
+def convert_epoch_ms_to_datetime(epoch_ms):
+    return datetime.fromtimestamp(epoch_ms / 1000)
 
-# Query next_fire_time for today
-cur.execute("""
-    SELECT trigger_name, next_fire_time 
-    FROM "SVC_PHM_OWNER".phm_ntfn_qrtz_triggers
-    WHERE next_fire_time IS NOT NULL
-    AND TO_TIMESTAMP(next_fire_time / 1000)::date = CURRENT_DATE
-    ORDER BY next_fire_time ASC
-""")
+def send_email(subject, body):
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg.set_content(body)
 
-rows = cur.fetchall()
-fire_times = [(row[0], row[1]) for row in rows]
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.send_message(msg)
 
-# Close DB
-cur.close()
-conn.close()
+def main():
+    conn = psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD
+    )
+    cursor = conn.cursor()
 
-# Process times
-fire_times.sort(key=lambda x: x[1])
-missed_times = []
-log_lines = []
+    query = """
+        SELECT trigger_name, next_fire_time
+        FROM "SVC_PHM_OWNER".phm_ntfn_qrtz_triggers
+        WHERE to_timestamp(next_fire_time / 1000)::date = CURRENT_DATE
+        ORDER BY next_fire_time;
+    """
+    cursor.execute(query)
+    rows = cursor.fetchall()
 
-for idx in range(len(fire_times)):
-    trigger, ts = fire_times[idx]
-    dt = datetime.datetime.fromtimestamp(ts / 1000.0)
-    log_lines.append(f"{idx + 1}. {trigger} → {dt}")
+    previous_time = None
+    missed_times = []
+    next_times_logged = []
 
-# Check gaps
-for i in range(1, len(fire_times)):
-    prev_ts = fire_times[i - 1][1]
-    curr_ts = fire_times[i][1]
-    gap_minutes = (curr_ts - prev_ts) / (60 * 1000)
+    for row in rows:
+        trigger_name, next_fire_time_ms = row
+        next_time = convert_epoch_ms_to_datetime(next_fire_time_ms)
+        next_times_logged.append(next_time)
 
-    if gap_minutes > 15:
-        missed_times.append((fire_times[i - 1], fire_times[i], gap_minutes))
+        if previous_time:
+            gap = (next_time - previous_time).total_seconds() / 60
+            if gap > 15:
+                missed_times.append((previous_time, next_time, gap))
+        previous_time = next_time
 
-# Log results
-with open("logs/firetime_check.log", "a") as log_file:
-    log_file.write("\n--- Run at {} ---\n".format(datetime.datetime.now()))
-    log_file.write("Total next_fire_time entries in past 24 hours: {}\n".format(len(fire_times)))
-    log_file.write("Expected entries: 96\n")
-    log_file.write("Missed entries (gap > 15 mins): {}\n\n".format(len(missed_times)))
-
-    for line in log_lines:
-        log_file.write(line + "\n")
+    # Logging
+    logging.info(f"Total next_fire_time entries found today: {len(next_times_logged)}")
+    for time in next_times_logged:
+        logging.info(f"Next Fire Time: {time}")
 
     if missed_times:
-        log_file.write("\n⚠️ Missed Entries:\n")
+        body = "Missed Fire Time Gaps Detected:\n\n"
         for prev, curr, gap in missed_times:
-            prev_dt = datetime.datetime.fromtimestamp(prev[1] / 1000.0)
-            curr_dt = datetime.datetime.fromtimestamp(curr[1] / 1000.0)
-            log_file.write(f"Missed between {prev_dt} → {curr_dt} | Gap: {gap:.2f} mins\n")
+            line = f"Gap of {gap:.2f} mins between {prev} and {curr}\n"
+            logging.warning(line.strip())
+            body += line
 
-# Print summary on screen
-print("\n===== Fire Time Summary (Past 24 Hours) =====")
-print(f"Total entries found         : {len(fire_times)}")
-print(f"Expected entries (every 15m): 96")
-print(f"Missed entries (gap > 15m)  : {len(missed_times)}")
-print("=============================================\n")
+        send_email("Missed Fire Time Alert", body)
+    else:
+        logging.info("All next_fire_time entries are within the expected 15-minute gap.")
 
-if missed_times:
-    print("⚠️ Missed Time Gaps:")
-    for prev, curr, gap in missed_times:
-        prev_dt = datetime.datetime.fromtimestamp(prev[1] / 1000.0)
-        curr_dt = datetime.datetime.fromtimestamp(curr[1] / 1000.0)
-        print(f"{prev_dt} → {curr_dt} | Gap: {gap:.2f} mins")
+    cursor.close()
+    conn.close()
 
-    # Send email alert
-    body = "❌ PHM Notification Gaps Detected:\n\n"
-    for prev, curr, gap in missed_times:
-        prev_dt = datetime.datetime.fromtimestamp(prev[1] / 1000.0)
-        curr_dt = datetime.datetime.fromtimestamp(curr[1] / 1000.0)
-        body += f"{prev_dt} → {curr_dt} | Gap: {gap:.2f} mins\n"
-
-    msg = MIMEText(body)
-    msg['Subject'] = "🚨 PHM Notification Gap Detected"
-    msg['From'] = os.getenv("EMAIL_FROM")
-    msg['To'] = os.getenv("EMAIL_TO")
-
-    with smtplib.SMTP(os.getenv("SMTP_HOST"), int(os.getenv("SMTP_PORT"))) as server:
-        server.sendmail(msg['From'], [msg['To']], msg.as_string())
-
-    print("\n📧 Alert email sent.\n")
-else:
-    print("✅ All gaps within 15 minutes.\n")
+if __name__ == "__main__":
+    main()
