@@ -37,3 +37,19 @@ SELECT
   to_timestamp(next_fire_time / 1000) AS next_fire_time_ts
 FROM "SVC_PHM_OWNER".phm_ntfn_qrtz_triggers
 ORDER BY next_fire_time_ts DESC;
+
+WITH ordered_times AS (
+  SELECT
+    next_fire_time,
+    to_timestamp(next_fire_time / 1000) AS fire_ts,
+    LAG(to_timestamp(next_fire_time / 1000)) OVER (ORDER BY next_fire_time) AS prev_fire_ts
+  FROM "SVC_PHM_OWNER".phm_ntfn_qrtz_triggers
+  WHERE to_timestamp(next_fire_time / 1000) >= NOW() - INTERVAL '24 hours'
+)
+SELECT
+  fire_ts,
+  prev_fire_ts,
+  EXTRACT(EPOCH FROM (fire_ts - prev_fire_ts)) / 60 AS gap_minutes
+FROM ordered_times
+WHERE prev_fire_ts IS NOT NULL
+ORDER BY fire_ts;
