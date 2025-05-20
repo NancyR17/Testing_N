@@ -1,0 +1,162 @@
+import croniter
+import datetime
+import psycopg2
+# from azure.identity import DefaultAzureCredential  # Not used for local testing
+# from azure.keyvault.secrets import SecretClient  # Not used for local testing
+from typing import List, Tuple, Optional
+
+def calculate_cron_times(cron_expression: str, reference_time: datetime.datetime) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime]]:
+    """
+    Calculates the previous and next fire times for a given cron expression
+    relative to a given reference_time.
+
+    Args:
+        cron_expression: The cron expression string.
+        reference_time: The time to use as the reference for calculation.
+                        This should be a timezone-naive datetime object
+                        to match typical database 'timestamp without time zone'.
+
+    Returns:
+        A tuple containing the previous and next fire times as datetime objects.
+        Returns (None, None) if the cron expression is invalid or an error occurs.
+    """
+    try:
+        # croniter often works best with timezone-naive datetimes if your source (DB) is naive.
+        iter = croniter.croniter(cron_expression, reference_time)
+        previous_fire_time = iter.prev(datetime.datetime)
+        next_fire_time = iter.next(datetime.datetime)
+        return previous_fire_time, next_fire_time
+    except croniter.CroniterBadCronError:
+        print(f"Error: Invalid cron expression: {cron_expression}")
+        return None, None
+    except Exception as e:
+        print(f"Error calculating cron times for '{cron_expression}': {e}")
+        return None, None
+
+
+def fetch_cron_triggers_from_db(connection_params: dict) -> List[Tuple[str, str, int, datetime.datetime, datetime.datetime]]:
+    """
+    Fetches cron trigger information from the database.
+
+    Args:
+        connection_params: A dictionary containing the database connection parameters
+                           (e.g., host, port, database, user, password).
+
+    Returns:
+        A list of tuples, where each tuple contains:
+        (trigger_name, cron_expression, priority, next_fire_time, prev_fire_time).
+        Returns an empty list on error.
+    """
+    try:
+        conn = psycopg2.connect(**connection_params)
+        cursor = conn.cursor()
+        # Query to fetch relevant trigger data.
+        cursor.execute("""
+            SELECT
+                trigger_name,
+                cron_expression,
+                priority,
+                to_timestamp(next_fire_time / 1000) as next_fire_time,  -- Convert from milliseconds
+                to_timestamp(prev_fire_time / 1000) as prev_fire_time   -- Convert from milliseconds
+            FROM
+                "SVC_PHM_OWNER".phm_ntfn_qrtz_triggers  --  <--  Verify your schema and table name!
+            WHERE
+                trigger_type = 'CRON'
+            ORDER BY
+                trigger_name;
+        """)
+        triggers = cursor.fetchall()
+        conn.close()
+        return [(row[0], row[1], row[2], row[3], row[4]) for row in triggers]
+    except psycopg2.Error as e:
+        print(f"Error fetching data from database: {e}")
+        return []
+    except Exception as e:
+        print(f"General error fetching data: {e}")
+        return []
+
+
+def analyze_cron_triggers(
+    db_triggers: List[Tuple[str, str, int, datetime.datetime, datetime.datetime]],
+    analysis_reference_time: datetime.datetime # Renamed for clarity
+) -> None:
+    """
+    Analyzes cron triggers fetched from the database, comparing expected and actual fire times.
+
+    Args:
+        db_triggers: A list of tuples representing cron triggers from the database.
+                     Each tuple: (trigger_name, cron_expression, priority, db_next_fire_time, db_prev_fire_time).
+        analysis_reference_time: The current time (or any specific time) to use as a reference
+                                 for calculating expected cron fire times.
+    """
+    print("-" * 80)
+    print(f"Cron Trigger Analysis (Reference Time: {analysis_reference_time.isoformat()})")
+    print("-" * 80)
+
+    for trigger_name, cron_expression, priority, db_next_fire_time, db_prev_fire_time in db_triggers:
+        print(f"Trigger: {trigger_name}, Cron: {cron_expression}, Priority: {priority}")
+
+        # Calculate expected previous and next based on the cron expression relative to the analysis_reference_time
+        expected_prev_fire_time, expected_next_fire_time = calculate_cron_times(cron_expression, analysis_reference_time)
+
+        if expected_prev_fire_time and expected_next_fire_time:
+            print(f"  Expected Previous Fire (calculated by croniter relative to reference time): {expected_prev_fire_time.isoformat()}")
+            print(f"  Expected Next Fire (calculated by croniter relative to reference time):     {expected_next_fire_time.isoformat()}")
+            print(f"  DB Previous Fire (from QRTZ table):                                       {db_prev_fire_time.isoformat() if db_prev_fire_time else 'None'}")
+            print(f"  DB Next Fire (from QRTZ table):                                           {db_next_fire_time.isoformat() if db_next_fire_time else 'None'}")
+
+            #  Check if the scheduled fire times from the DB are close to what we expect.
+            tolerance = datetime.timedelta(minutes=1)  # Allow a 1-minute tolerance
+
+            if db_prev_fire_time:
+                time_diff_prev = abs(db_prev_fire_time - expected_prev_fire_time)
+                if time_diff_prev > tolerance:
+                    print(f"  WARNING: Previous fire time deviation (DB vs. Expected) exceeds tolerance: {time_diff_prev}")
+            else:
+                print("  INFO: Previous fire time in DB is NULL (may not have fired yet).")
+
+            if db_next_fire_time:
+                time_diff_next = abs(db_next_fire_time - expected_next_fire_time)
+                if time_diff_next > tolerance:
+                    print(f"  WARNING: Next fire time deviation (DB vs. Expected) exceeds tolerance: {time_diff_next}")
+
+        else:
+            print("  Skipping comparison due to invalid cron expression.")
+        print("-" * 80)
+
+
+# Placeholder for Key Vault interaction (not used in local testing)
+def get_database_connection_params_from_keyvault(key_vault_name: str, secret_names: List[str]) -> dict:
+    # This function is not used when running locally without Key Vault
+    print("Warning: get_database_connection_params_from_keyvault is called but not functional in local testing.")
+    return {} # Return empty dict to indicate failure to retrieve
+
+def main():
+    """
+    Main function to connect to the database, fetch cron triggers, and analyze their fire times.
+    """
+    # --- START LOCAL DATABASE CONFIGURATION ---
+    # IMPORTANT: Replace these with your actual PostgreSQL database credentials.
+    # For local testing, ensure your database is running and accessible.
+    connection_params = {
+        "host": "your_db_host",      # e.g., "localhost" or "127.0.0.1"
+        "port": "your_db_port",      # e.g., "5432"
+        "database": "your_db_name",
+        "user": "your_db_user",
+        "password": "your_db_password"
+    }
+    # --- END LOCAL DATABASE CONFIGURATION ---
+
+    # Set the current time for analysis.
+    # For accurate comparison, it should ideally be timezone-naive if your DB is 'timestamp without time zone'.
+    # If your DB stores UTC or a specific timezone, you should make this time timezone-aware and consistent.
+    analysis_current_time = datetime.datetime.now() # This captures the current system time
+
+    db_triggers = fetch_cron_triggers_from_db(connection_params)
+    if db_triggers:
+        analyze_cron_triggers(db_triggers, analysis_current_time)
+    else:
+        print("Failed to retrieve cron triggers from the database. Please check your database connection parameters and ensure the table exists.")
+
+if __name__ == "__main__":
+    main()
