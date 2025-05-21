@@ -1,0 +1,399 @@
+import croniter
+import datetime
+import psycopg2
+import csv
+# import smtplib # Commented out for local testing without email
+# import ssl # Commented out for local testing without email
+# from email.mime.text import MIMEText # Commented out for local testing without email
+# from email.mime.multipart import MIMEMultipart # Commented out for local testing without email
+from typing import List, Tuple, Optional, Dict, Any
+
+# --- Email Configuration (Commented out for local testing) ---
+# When you deploy to AKS, ensure your SMTP server is reachable and configured.
+# Uncomment and fill these details for email alerts.
+# SMTP_SERVER = "mail.earth.com"
+# SMTP_PORT = 25                   # Often 587 for TLS, 465 for SSL, or 25 for unencrypted
+# SENDER_EMAIL = "your_alert_sender@earth.com"
+# SENDER_PASSWORD = "your_email_password" # Uncomment and fill if your SMTP needs authentication
+# RECEIVER_EMAILS = ["recipient1@example.com", "recipient2@example.com"]
+# --- End Email Configuration ---
+
+# --- CSV Configuration ---
+CSV_FILE_NAME = "cron_analysis_report.csv"
+# --- End CSV Configuration ---
+
+def calculate_cron_times(reference_time: datetime.datetime, cron_expression: str) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime]]:
+    """
+    Calculates the single previous and next fire times for a given cron expression
+    relative to a given reference_time using croniter.
+    """
+    try:
+        iter = croniter.croniter(cron_expression, reference_time)
+        previous_fire_time = iter.prev(datetime.datetime)
+        next_fire_time = iter.next(datetime.datetime)
+        return previous_fire_time, next_fire_time
+    except croniter.CroniterBadCronError:
+        # print(f"Error: Invalid cron expression: {cron_expression}")
+        return None, None
+    except Exception as e:
+        # print(f"Error calculating cron times for '{cron_expression}': {e}")
+        return None, None
+
+def calculate_expected_fire_times_in_period(cron_expression: str, start_time: datetime.datetime, end_time: datetime.datetime) -> List[datetime.datetime]:
+    """
+    Generates all expected fire times for a cron expression within a specified time range using croniter.
+    """
+    expected_times = []
+    try:
+        iter = croniter.croniter(cron_expression, start_time - datetime.timedelta(seconds=1))
+        next_occurrence = iter.next(datetime.datetime)
+        while next_occurrence <= end_time:
+            if next_occurrence >= start_time:
+                expected_times.append(next_occurrence)
+            try:
+                next_occurrence = iter.next(datetime.datetime)
+            except StopIteration:
+                break
+    except croniter.CroniterBadCronError:
+        # print(f"Error: Invalid cron expression '{cron_expression}' for period calculation.")
+        return []
+    except Exception as e:
+        # print(f"Error generating expected times for '{cron_expression}': {e}")
+        return []
+
+
+def fetch_cron_triggers_from_db(connection_params: dict) -> List[Tuple[str, str, int, Optional[datetime.datetime], Optional[datetime.datetime]]]:
+    """
+    Fetches cron trigger information from the QRTZ database table,
+    converting epoch milliseconds to datetime objects.
+    """
+    try:
+        conn = psycopg2.connect(**connection_params)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                trigger_name,
+                cron_expression,
+                priority,
+                CASE
+                    WHEN next_fire_time IS NOT NULL THEN to_timestamp(next_fire_time / 1000)
+                    ELSE NULL
+                END as next_fire_time,
+                CASE
+                    WHEN prev_fire_time IS NOT NULL THEN to_timestamp(prev_fire_time / 1000)
+                    ELSE NULL
+                END as prev_fire_time
+            FROM
+                "SVC_PHM_OWNER".phm_ntfn_qrtz_triggers
+            WHERE
+                trigger_type = 'CRON'
+            ORDER BY
+                trigger_name;
+        """)
+        triggers = cursor.fetchall()
+        conn.close()
+        return [
+            (row[0], row[1], row[2], row[3], row[4])
+            for row in triggers
+        ]
+    except psycopg2.Error as e:
+        print(f"Error fetching QRTZ trigger data from database: {e}")
+        return []
+    except Exception as e:
+        print(f"General error fetching QRTZ trigger data: {e}")
+        return []
+
+def fetch_actual_runs_from_audit_db(connection_params: dict, start_time: datetime.datetime, end_time: datetime.datetime) -> Dict[str, List[datetime.datetime]]:
+    """
+    Fetches actual run start times for all triggers from the audit table within a given period.
+    Returns a dictionary mapping trigger_name to a list of its actual run datetimes.
+    """
+    actual_runs: Dict[str, List[datetime.datetime]] = {}
+    try:
+        conn = psycopg2.connect(**connection_params)
+        cursor = conn.cursor()
+
+        # Convert datetime objects to epoch milliseconds for the SQL query
+        start_time_epoch_ms = int(start_time.timestamp() * 1000)
+        end_time_epoch_ms = int(end_time.timestamp() * 1000)
+
+        # Assuming 'start_time' column in audit table is also epoch milliseconds
+        cursor.execute(f"""
+            SELECT
+                trigger_name,
+                to_timestamp(start_time / 1000) as actual_start_time
+            FROM
+                "SVC_PHM_OWNER".phm_notification_audit
+            WHERE
+                start_time >= %s AND start_time <= %s
+            ORDER BY
+                trigger_name, actual_start_time;
+        """, (start_time_epoch_ms, end_time_epoch_ms))
+
+        for row in cursor.fetchall():
+            trigger_name = row[0]
+            actual_start_time = row[1]
+            if trigger_name not in actual_runs:
+                actual_runs[trigger_name] = []
+            if actual_start_time: # Ensure actual_start_time is not None
+                actual_runs[trigger_name].append(actual_start_time)
+        conn.close()
+    except psycopg2.Error as e:
+        print(f"Error fetching audit data from database: {e}")
+    except Exception as e:
+        print(f"General error fetching audit data: {e}")
+    return actual_runs
+
+
+# The send_alert_email function is entirely commented out for local testing.
+# Uncomment it and fill in SMTP details when ready for AKS deployment.
+# def send_alert_email(subject: str, body: str) -> bool:
+#     # """
+#     # Sends an email alert.
+#     # """
+#     # try:
+#     #     msg = MIMEMultipart("alternative")
+#     #     msg["From"] = SENDER_EMAIL
+#     #     msg["To"] = ", ".join(RECEIVER_EMAILS)
+#     #     msg["Subject"] = subject
+#     #
+#     #     msg.attach(MIMEText(body, "plain"))
+#     #
+#     #     with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+#     #         # --- Configuration for TLS/SSL (uncomment if needed) ---
+#     #         # if SMTP_PORT == 587:
+#     #         #     server.starttls(context=ssl.create_default_context())
+#     #         # elif SMTP_PORT == 465:
+#     #         #     # For port 465, typically use smtplib.SMTP_SSL directly
+#     #         #     server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=ssl.create_default_context())
+#     #         # --- End TLS/SSL Configuration ---
+#     #
+#     #         # --- Configuration for Authentication (uncomment if needed) ---
+#     #         # if 'SENDER_PASSWORD' in globals() and SENDER_PASSWORD:
+#     #         #     server.login(SENDER_EMAIL, SENDER_PASSWORD)
+#     #         # --- End Authentication Configuration ---
+#     #
+#     #         server.sendmail(SENDER_EMAIL, RECEIVER_EMAILS, msg.as_string())
+#     #     print(f"Email alert sent successfully to {', '.join(RECEIVER_EMAILS)} via {SMTP_SERVER}:{SMTP_PORT}.")
+#     #     return True
+#     # except smtplib.SMTPAuthenticationError:
+#     #     print("ERROR: Email authentication failed. Check username and password.")
+#     #     return False
+#     # except smtplib.SMTPConnectError as e:
+#     #     print(f"ERROR: Could not connect to SMTP server '{SMTP_SERVER}:{SMTP_PORT}': {e}")
+#     #     print("Please check if the SMTP server is reachable and if your firewall allows outgoing connections on this port.")
+#     #     return False
+#     # except Exception as e:
+#     #     print(f"ERROR: Failed to send email alert: {e}")
+#     #     return False
+
+
+def analyze_cron_triggers_for_24_hours(
+    db_triggers: List[Tuple[str, str, int, Optional[datetime.datetime], Optional[datetime.datetime]]],
+    current_analysis_time: datetime.datetime,
+    connection_params: dict # Pass connection_params to fetch audit data
+) -> None:
+    """
+    Analyzes cron triggers for the last 24 hours, comparing expected runs from croniter
+    with actual runs from the audit table.
+    Prints detailed output to console and writes to CSV.
+    """
+    print("-" * 80)
+    print(f"Cron Trigger 24-Hour Analysis (Current Time: {current_analysis_time.isoformat()})")
+    print("-" * 80)
+
+    csv_data: List[Dict[str, Any]] = []
+    # CSV Header
+    csv_data.append({
+        "Trigger_Name": "Trigger Name",
+        "Cron_Expression": "Cron Expression",
+        "Expected_Fire_Time": "Expected Fire Time (UTC)",
+        "Actual_Run_Time_Audit": "Actual Run Time (Audit) (UTC)",
+        "Run_Status": "Run Status",
+        "DB_Quartz_Prev_Fire_Time": "DB Quartz Prev Fire Time (UTC)", # Last recorded by Quartz
+        "DB_Quartz_Next_Fire_Time": "DB Quartz Next Fire Time (UTC)", # Next planned by Quartz
+        "Overall_Trigger_Summary": "Overall Trigger Summary (24h)"
+    })
+
+    alerts_to_send = [] # Collect messages for potential email alerts (if enabled)
+
+    analysis_end_time = current_analysis_time
+    analysis_start_time = current_analysis_time - datetime.timedelta(hours=24)
+
+    print(f"Analyzing runs between {analysis_start_time.isoformat()} and {analysis_end_time.isoformat()}")
+    print("-" * 80)
+
+    # Fetch all relevant actual runs from the audit table for the 24-hour period
+    all_actual_runs = fetch_actual_runs_from_audit_db(connection_params, analysis_start_time, analysis_end_time)
+    
+    tolerance = datetime.timedelta(minutes=2) # Tolerance for matching timestamps
+
+    for trigger_name, cron_expression, priority, db_next_fire_time_quartz, db_prev_fire_time_quartz in db_triggers:
+        print(f"\nAnalyzing Trigger: {trigger_name}")
+        print(f"  Cron Expression: '{cron_expression}'")
+        print(f"  Priority: {priority}")
+        print(f"  DB Quartz Prev Fire Time: {db_prev_fire_time_quartz.isoformat() if db_prev_fire_time_quartz else 'None'}")
+        print(f"  DB Quartz Next Fire Time: {db_next_fire_time_quartz.isoformat() if db_next_fire_time_quartz else 'None'}")
+
+        expected_runs_in_24h = calculate_expected_fire_times_in_period(cron_expression, analysis_start_time, analysis_end_time)
+        actual_runs_for_trigger = all_actual_runs.get(trigger_name, [])
+        
+        # Sort actual runs to make matching easier
+        actual_runs_for_trigger.sort()
+
+        print(f"  Expected runs in last 24h: {len(expected_runs_in_24h)}")
+        print(f"  Actual runs (from audit) in last 24h: {len(actual_runs_for_trigger)}")
+
+        if not expected_runs_in_24h:
+            print(f"  INFO: No expected runs for this cron ('{cron_expression}') in the last 24 hours.")
+            print(f"        (This might be a cron for a different period, or an invalid cron expression.)")
+            # Add a single row to CSV for this scenario
+            csv_data.append({
+                "Trigger_Name": trigger_name,
+                "Cron_Expression": cron_expression,
+                "Expected_Fire_Time": "N/A - No expected runs",
+                "Actual_Run_Time_Audit": "N/A",
+                "Run_Status": "NO_EXPECTED_RUNS_IN_PERIOD",
+                "DB_Quartz_Prev_Fire_Time": db_prev_fire_time_quartz.isoformat() if db_prev_fire_time_quartz else "None",
+                "DB_Quartz_Next_Fire_Time": db_next_fire_time_quartz.isoformat() if db_next_fire_time_quartz else "None",
+                "Overall_Trigger_Summary": "NO_EXPECTED_RUNS_IN_PERIOD"
+            })
+            print("--------------------------------------------------------------------------------")
+            continue
+
+        # --- Compare Expected vs Actual Runs ---
+        matched_actual_runs_count = 0
+        missed_expected_runs = []
+        unmatched_actual_runs = list(actual_runs_for_trigger) # Copy to track unmatched
+
+        for expected_time in expected_runs_in_24h:
+            found_match = False
+            for actual_time in list(unmatched_actual_runs): # Iterate over a copy to safely modify
+                if abs(expected_time - actual_time) <= tolerance:
+                    # Found a match
+                    csv_data.append({
+                        "Trigger_Name": trigger_name,
+                        "Cron_Expression": cron_expression,
+                        "Expected_Fire_Time": expected_time.isoformat(),
+                        "Actual_Run_Time_Audit": actual_time.isoformat(),
+                        "Run_Status": "SUCCESS_MATCH",
+                        "DB_Quartz_Prev_Fire_Time": db_prev_fire_time_quartz.isoformat() if db_prev_fire_time_quartz else "None",
+                        "DB_Quartz_Next_Fire_Time": db_next_fire_time_quartz.isoformat() if db_next_fire_time_quartz else "None",
+                        "Overall_Trigger_Summary": "" # Will fill summary later per trigger
+                    })
+                    matched_actual_runs_count += 1
+                    unmatched_actual_runs.remove(actual_time) # Remove this actual run as it's been matched
+                    found_match = True
+                    break # Move to next expected_time
+            if not found_match:
+                # No actual run found for this expected_time within tolerance
+                missed_expected_runs.append(expected_time)
+                csv_data.append({
+                    "Trigger_Name": trigger_name,
+                    "Cron_Expression": cron_expression,
+                    "Expected_Fire_Time": expected_time.isoformat(),
+                    "Actual_Run_Time_Audit": "MISSED (No Actual Run Found)",
+                    "Run_Status": "MISSED_EXPECTED",
+                    "DB_Quartz_Prev_Fire_Time": db_prev_fire_time_quartz.isoformat() if db_prev_fire_time_quartz else "None",
+                    "DB_Quartz_Next_Fire_Time": db_next_fire_time_quartz.isoformat() if db_next_fire_time_quartz else "None",
+                    "Overall_Trigger_Summary": "" # Will fill summary later
+                })
+        
+        # Add any actual runs that didn't match an expected run (should be rare for cron)
+        for actual_time in unmatched_actual_runs:
+            csv_data.append({
+                "Trigger_Name": trigger_name,
+                "Cron_Expression": cron_expression,
+                "Expected_Fire_Time": "N/A (No Expected Match)",
+                "Actual_Run_Time_Audit": actual_time.isoformat(),
+                "Run_Status": "UNEXPECTED_ACTUAL", # An actual run without a close expected time
+                "DB_Quartz_Prev_Fire_Time": db_prev_fire_time_quartz.isoformat() if db_prev_fire_time_quartz else "None",
+                "DB_Quartz_Next_Fire_Time": db_next_fire_time_quartz.isoformat() if db_next_fire_time_quartz else "None",
+                "Overall_Trigger_Summary": "" # Will fill summary later
+            })
+
+        # --- Generate Overall Trigger Summary and Alerts ---
+        overall_summary = ""
+        if not missed_expected_runs and not unmatched_actual_runs:
+            overall_summary = f"SUCCESS: All {total_expected_runs} expected runs matched with actual runs."
+        else:
+            overall_summary = (f"DEVIATION: {len(missed_expected_runs)} expected runs missed, "
+                               f"{len(unmatched_actual_runs)} unexpected actual runs.")
+            
+            alert_message = (f"[{trigger_name}] DEVIATION DETECTED: {overall_summary}\n"
+                             f"  Total Expected Runs (24h): {total_expected_runs}\n"
+                             f"  Matched Actual Runs: {matched_actual_runs_count}\n"
+                             f"  Missed Expected Runs at: {[t.isoformat() for t in missed_expected_runs]}\n"
+                             f"  Unexpected Actual Runs at: {[t.isoformat() for t in unmatched_actual_runs]}\n")
+            alerts_to_send.append(alert_message)
+
+        print(f"  {overall_summary}")
+        # Update Overall_Trigger_Summary for all rows belonging to this trigger that were just added
+        for i in range(len(csv_data) - (total_expected_runs + len(unmatched_actual_runs) if expected_runs_in_24h else 1), len(csv_data)):
+             # Adjust this range if the order of append operations changes
+            if csv_data[i].get("Trigger_Name") == trigger_name: # Ensure we're updating rows for the current trigger
+                csv_data[i]["Overall_Trigger_Summary"] = overall_summary
+
+        print("--------------------------------------------------------------------------------")
+
+    # --- Write data to CSV file ---
+    if csv_data:
+        # Use the keys from the first actual data row as fieldnames for csv.DictWriter
+        # We need to explicitly define fieldnames to ensure order
+        fieldnames = [
+            "Trigger_Name", "Cron_Expression", "Expected_Fire_Time",
+            "Actual_Run_Time_Audit", "Run_Status",
+            "DB_Quartz_Prev_Fire_Time", "DB_Quartz_Next_Fire_Time",
+            "Overall_Trigger_Summary"
+        ]
+        
+        try:
+            with open(CSV_FILE_NAME, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader() # Write the actual header row
+                for row in csv_data[1:]: # Skip the first item which was our custom header definition
+                    writer.writerow(row)
+            print(f"\nAnalysis results written to '{CSV_FILE_NAME}' successfully.")
+        except IOError as e:
+            print(f"ERROR: Could not write CSV file '{CSV_FILE_NAME}': {e}")
+    else:
+        print("\nNo data to write to CSV.")
+
+    # --- EMAIL ALERT TRIGGERING SECTION - COMMENTED OUT FOR LAPTOP TESTING ---
+    if alerts_to_send:
+        alert_subject = "CRON JOB MONITORING ALERT: Deviations Detected!"
+        alert_body = "The following cron job deviations were detected:\n\n" + "\n\n".join(alerts_to_send)
+        alert_body += f"\n\nAnalysis performed at: {current_analysis_time.isoformat()}"
+        # Uncomment the next line to enable email sending
+        # send_alert_email(alert_subject, alert_body)
+        print("\n--- ALERT: Email would have been sent (currently disabled) ---")
+    else:
+        print("\nNo significant deviations detected. All cron jobs appear to be on schedule.")
+    # --- END COMMENTED SECTION ---
+
+    print("\n--- Analysis Complete ---")
+    print("Email alerting is currently disabled. Check the console output for warnings.")
+    print(f"Detailed report saved to '{CSV_FILE_NAME}'.")
+    print("--------------------------")
+
+
+# Placeholder for Key Vault interaction (not used in local testing)
+# You can remove this function if you don't plan to use Key Vault at all.
+def get_database_connection_params_from_keyvault(key_vault_name: str, secret_names: List[str]) -> dict:
+    print("Warning: get_database_connection_params_from_keyvault is called but not functional in local testing.")
+    return {}
+
+def main():
+    """
+    Main function to connect to the database, fetch cron triggers, and analyze their fire times.
+    """
+    # --- START LOCAL DATABASE CONFIGURATION ---
+    # IMPORTANT: Replace these with your actual PostgreSQL database credentials.
+    # For local testing, ensure your database is running and accessible.
+    connection_params = {
+        "host": "your_db_host",      # e.g., "localhost" or "127.0.0.1"
+        "port": "your_db_port",      # e.g., "5432"
+        "database": "your_db_name",
+        "user": "your_db_user",
+        "password": "your_db_password"
+    
