@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# Set MAVEN_HOME to point to your new Maven 3.9.9 installation via the 'latest' symlink
+export M2_HOME="/opt/maven/latest"
+export MAVEN_HOME="$M2_HOME"
+
+# Add Maven's bin directory to the PATH
+export PATH="$M2_HOME/bin:$PATH"
+
+sudo vi /etc/profile.d/maven.sh
+
+sudo chmod +x /etc/profile.d/maven.sh
+
+source /etc/profile.d/maven.sh
