@@ -1,0 +1,314 @@
+import croniter
+import datetime
+import psycopg2
+# import smtplib # Commented out for local testing without email
+# import ssl # Commented out for local testing without email
+# from email.mime.text import MIMEText # Commented out for local testing without email
+# from email.mime.multipart import MIMEMultipart # Commented out for local testing without email
+from typing import List, Tuple, Optional, Dict
+
+# --- Email Configuration (Commented out for local testing) ---
+# When you deploy to AKS, ensure your SMTP server is reachable and configured.
+# Uncomment and fill these details for email alerts.
+# SMTP_SERVER = "mail.earth.com"
+# SMTP_PORT = 25                   # Often 587 for TLS, 465 for SSL, or 25 for unencrypted
+# SENDER_EMAIL = "your_alert_sender@earth.com"
+# SENDER_PASSWORD = "your_email_password" # Uncomment and fill if your SMTP needs authentication
+# RECEIVER_EMAILS = ["recipient1@example.com", "recipient2@example.com"]
+# --- End Email Configuration ---
+
+def calculate_cron_times(reference_time: datetime.datetime, cron_expression: str) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime]]:
+    """
+    Calculates the single previous and next fire times for a given cron expression
+    relative to a given reference_time using croniter.
+
+    Args:
+        reference_time: The time to use as the reference for calculation.
+                        This should be a timezone-naive datetime object
+                        to match typical database 'timestamp without time zone'.
+        cron_expression: The cron expression string.
+
+    Returns:
+        A tuple containing the previous and next fire times as datetime objects.
+        Returns (None, None) if the cron expression is invalid or an error occurs.
+    """
+    try:
+        iter = croniter.croniter(cron_expression, reference_time)
+        previous_fire_time = iter.prev(datetime.datetime)
+        next_fire_time = iter.next(datetime.datetime)
+        return previous_fire_time, next_fire_time
+    except croniter.CroniterBadCronError:
+        print(f"Error: Invalid cron expression: {cron_expression}")
+        return None, None
+    except Exception as e:
+        print(f"Error calculating cron times for '{cron_expression}': {e}")
+        return None, None
+
+def calculate_expected_fire_times_in_period(cron_expression: str, start_time: datetime.datetime, end_time: datetime.datetime) -> List[datetime.datetime]:
+    """
+    Generates all expected fire times for a cron expression within a specified time range using croniter.
+
+    Args:
+        cron_expression: The cron expression string.
+        start_time: The beginning of the period.
+        end_time: The end of the period.
+
+    Returns:
+        A list of datetime objects representing expected fire times.
+    """
+    expected_times = []
+    try:
+        # Start the iterator from just before the period to ensure the first occurrence in the period is captured.
+        iter = croniter.croniter(cron_expression, start_time - datetime.timedelta(seconds=1))
+        next_occurrence = iter.next(datetime.datetime) # Get the first occurrence AFTER the iterator's start point
+        while next_occurrence <= end_time:
+            if next_occurrence >= start_time: # Only include if within the specified range [start_time, end_time]
+                expected_times.append(next_occurrence)
+            try:
+                next_occurrence = iter.next(datetime.datetime)
+            except StopIteration: # No more occurrences in the future for this cron
+                break
+    except croniter.CroniterBadCronError:
+        print(f"Error: Invalid cron expression '{cron_expression}' for period calculation.")
+        return []
+    except Exception as e:
+        print(f"Error generating expected times for '{cron_expression}': {e}")
+    return expected_times
+
+
+def fetch_cron_triggers_from_db(connection_params: dict) -> List[Tuple[str, str, int, Optional[datetime.datetime], Optional[datetime.datetime]]]:
+    """
+    Fetches cron trigger information from the database, converting epoch milliseconds
+    to datetime objects.
+
+    Args:
+        connection_params: A dictionary containing the database connection parameters.
+
+    Returns:
+        A list of tuples, where each tuple contains:
+        (trigger_name, cron_expression, priority, next_fire_time, prev_fire_time).
+        Returns an empty list on error.
+    """
+    try:
+        conn = psycopg2.connect(**connection_params)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                trigger_name,
+                cron_expression,
+                priority,
+                -- Convert epoch milliseconds to timestamp (datetime)
+                CASE
+                    WHEN next_fire_time IS NOT NULL THEN to_timestamp(next_fire_time / 1000)
+                    ELSE NULL
+                END as next_fire_time,
+                CASE
+                    WHEN prev_fire_time IS NOT NULL THEN to_timestamp(prev_fire_time / 1000)
+                    ELSE NULL
+                END as prev_fire_time
+            FROM
+                "SVC_PHM_OWNER".phm_ntfn_qrtz_triggers
+            WHERE
+                trigger_type = 'CRON'
+            ORDER BY
+                trigger_name;
+        """)
+        triggers = cursor.fetchall()
+        conn.close()
+        return [
+            (
+                row[0],  # trigger_name (str)
+                row[1],  # cron_expression (str)
+                row[2],  # priority (int)
+                row[3],  # next_fire_time (datetime or None)
+                row[4]   # prev_fire_time (datetime or None)
+            ) for row in triggers
+        ]
+    except psycopg2.Error as e:
+        print(f"Error fetching data from database: {e}")
+        return []
+    except Exception as e:
+        print(f"General error fetching data: {e}")
+        return []
+
+
+# The send_alert_email function is entirely commented out for local testing.
+# Uncomment it and fill in SMTP details when ready for AKS deployment.
+# def send_alert_email(subject: str, body: str) -> bool:
+#     """
+#     Sends an email alert.
+#     """
+#     try:
+#         msg = MIMEMultipart("alternative")
+#         msg["From"] = SENDER_EMAIL
+#         msg["To"] = ", ".join(RECEIVER_EMAILS)
+#         msg["Subject"] = subject
+#
+#         msg.attach(MIMEText(body, "plain"))
+#
+#         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+#             # --- Configuration for TLS/SSL (uncomment if needed) ---
+#             # if SMTP_PORT == 587:
+#             #     server.starttls(context=ssl.create_default_context())
+#             # elif SMTP_PORT == 465:
+#             #     # For port 465, typically use smtplib.SMTP_SSL directly
+#             #     server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=ssl.create_default_context())
+#             # --- End TLS/SSL Configuration ---
+#
+#             # --- Configuration for Authentication (uncomment if needed) ---
+#             # if 'SENDER_PASSWORD' in globals() and SENDER_PASSWORD:
+#             #     server.login(SENDER_EMAIL, SENDER_PASSWORD)
+#             # --- End Authentication Configuration ---
+#
+#             server.sendmail(SENDER_EMAIL, RECEIVER_EMAILS, msg.as_string())
+#         print(f"Email alert sent successfully to {', '.join(RECEIVER_EMAILS)} via {SMTP_SERVER}:{SMTP_PORT}.")
+#         return True
+#     except smtplib.SMTPAuthenticationError:
+#         print("ERROR: Email authentication failed. Check username and password.")
+#         return False
+#     except smtplib.SMTPConnectError as e:
+#         print(f"ERROR: Could not connect to SMTP server '{SMTP_SERVER}:{SMTP_PORT}': {e}")
+#         print("Please check if the SMTP server is reachable and if your firewall allows outgoing connections on this port.")
+#         return False
+#     except Exception as e:
+#         print(f"ERROR: Failed to send email alert: {e}")
+#         return False
+
+
+def analyze_cron_triggers_for_24_hours(
+    db_triggers: List[Tuple[str, str, int, Optional[datetime.datetime], Optional[datetime.datetime]]],
+    current_analysis_time: datetime.datetime
+) -> None:
+    """
+    Analyzes cron triggers for the last 24 hours, comparing expected runs with DB's prev_fire_time.
+    Prints detailed output to console.
+    """
+    print("-" * 80)
+    print(f"Cron Trigger 24-Hour Analysis (Current Time: {current_analysis_time.isoformat()})")
+    print("-" * 80)
+
+    alerts_to_send = [] # Collect messages for potential email alerts (if enabled)
+
+    # Define the 24-hour analysis window
+    analysis_end_time = current_analysis_time
+    analysis_start_time = current_analysis_time - datetime.timedelta(hours=24)
+
+    print(f"Analyzing runs between {analysis_start_time.isoformat()} and {analysis_end_time.isoformat()}")
+    print("-" * 80)
+
+    for trigger_name, cron_expression, priority, db_next_fire_time, db_prev_fire_time in db_triggers:
+        print(f"\nAnalyzing Trigger: {trigger_name}")
+        print(f"  Cron Expression: '{cron_expression}'")
+        print(f"  Priority: {priority}")
+        print(f"  DB Scheduled Previous Fire Time: {db_prev_fire_time.isoformat() if db_prev_fire_time else 'None'}")
+        print(f"  DB Scheduled Next Fire Time:     {db_next_fire_time.isoformat() if db_next_fire_time else 'None'}")
+        # print(f"  Type of db_prev_fire_time: {type(db_prev_fire_time)}") # For verification
+        # print(f"  Type of db_next_fire_time: {type(db_next_fire_time)}") # For verification
+
+        # Calculate expected runs within the last 24 hours
+        expected_runs_in_24h = calculate_expected_fire_times_in_period(cron_expression, analysis_start_time, analysis_end_time)
+
+        # Calculate expected prev/next relative to current_analysis_time for general reference
+        expected_prev_now, expected_next_now = calculate_cron_times(current_analysis_time, cron_expression)
+        print(f"  Calculated Expected Previous Fire (relative to 'now'): {expected_prev_now.isoformat() if expected_prev_now else 'N/A'}")
+        print(f"  Calculated Expected Next Fire (relative to 'now'):     {expected_next_now.isoformat() if expected_next_now else 'N/A'}")
+
+        tolerance = datetime.timedelta(minutes=2) # Increased tolerance slightly to 2 minutes for practicality
+
+        if not expected_runs_in_24h:
+            print(f"  INFO: No expected runs for this cron ('{cron_expression}') in the last 24 hours.")
+            print(f"        (This might be a cron for a different period, or an invalid cron expression.)")
+            print("--------------------------------------------------------------------------------")
+            continue # Skip to next trigger
+
+        # --- Logic to verify 'every 15 min run' or '96 times' for last 24h ---
+        # As discussed, with only `db_prev_fire_time` (last reported prev from Quartz)
+        # we cannot check every single 'missed' run in the last 24 hours.
+        # We can only check if the *last known DB previous fire time* aligns with *any* expected run
+        # within a reasonable recent window.
+
+        total_expected_runs = len(expected_runs_in_24h)
+        match_found = False
+        
+        # We are checking if the DB's recorded prev_fire_time is close to *any* of the expected fire times
+        # that *should have occurred* in the last 24 hours.
+        if db_prev_fire_time:
+            for expected_time_in_period in reversed(expected_runs_in_24h): # Check most recent expected first
+                if abs(db_prev_fire_time - expected_time_in_period) <= tolerance:
+                    match_found = True
+                    break
+
+            if match_found:
+                print(f"  RESULT: The DB's previous fire time ({db_prev_fire_time.isoformat()}) "
+                      f"matches an expected run in the last 24 hours (within {tolerance}).")
+                print(f"  Expected {total_expected_runs} runs in the last 24 hours. "
+                      f"Based on the last reported DB time, the schedule appears to be mostly on track.")
+            else:
+                # If db_prev_fire_time exists but doesn't match any expected run in the period
+                alert_message = (f"  ALERT: Cron '{cron_expression}' - DB Previous Fire Time "
+                                 f"({db_prev_fire_time.isoformat()}) does NOT match any expected run "
+                                 f"in the last 24 hours (Expected {total_expected_runs} runs).")
+                print(alert_message)
+                alerts_to_send.append(f"[{trigger_name}] {alert_message}")
+                print("  Action: This suggests the job might have stopped firing or the DB's 'prev_fire_time' is not correctly updating.")
+        else:
+            # If db_prev_fire_time is NULL, it's definitely a concern if runs were expected
+            alert_message = (f"  CRITICAL ALERT: Cron '{cron_expression}' has {total_expected_runs} expected runs "
+                             f"in the last 24 hours, but DB Previous Fire Time is NULL.")
+            print(alert_message)
+            alerts_to_send.append(f"[{trigger_name}] {alert_message}")
+            print("  Action: This indicates the job has likely never fired or has been reset in the DB.")
+
+        print("--------------------------------------------------------------------------------")
+
+    # --- EMAIL ALERT TRIGGERING SECTION - COMMENTED OUT FOR LAPTOP TESTING ---
+    # if alerts_to_send:
+    #     alert_subject = "CRON JOB MONITORING ALERT: Deviations Detected!"
+    #     alert_body = "The following cron job deviations were detected:\n\n" + "\n".join(alerts_to_send)
+    #     alert_body += f"\n\nAnalysis performed at: {current_analysis_time.isoformat()}"
+    #     # Uncomment the next line to enable email sending
+    #     # send_alert_email(alert_subject, alert_body)
+    #     print("\n--- ALERT: Email would have been sent (currently disabled) ---")
+    # else:
+    #     print("\nNo significant deviations detected. All cron jobs appear to be on schedule.")
+    # --- END COMMENTED SECTION ---
+
+    print("\n--- Analysis Complete ---")
+    print("Email alerting is currently disabled. Check the console output for warnings.")
+    print("--------------------------")
+
+
+# Placeholder for Key Vault interaction (not used in local testing)
+# You can remove this function if you don't plan to use Key Vault at all.
+# from azure.identity import DefaultAzureCredential
+# from azure.keyvault.secrets import SecretClient
+def get_database_connection_params_from_keyvault(key_vault_name: str, secret_names: List[str]) -> dict:
+    print("Warning: get_database_connection_params_from_keyvault is called but not functional in local testing.")
+    return {}
+
+def main():
+    """
+    Main function to connect to the database, fetch cron triggers, and analyze their fire times.
+    """
+    # --- START LOCAL DATABASE CONFIGURATION ---
+    # IMPORTANT: Replace these with your actual PostgreSQL database credentials.
+    # For local testing, ensure your database is running and accessible.
+    connection_params = {
+        "host": "your_db_host",      # e.g., "localhost" or "127.0.0.1"
+        "port": "your_db_port",      # e.g., "5432"
+        "database": "your_db_name",
+        "user": "your_db_user",
+        "password": "your_db_password"
+    }
+    # --- END LOCAL DATABASE CONFIGURATION ---
+
+    current_analysis_time = datetime.datetime.now() # This is the "now" for analysis
+
+    db_triggers = fetch_cron_triggers_from_db(connection_params)
+    if db_triggers:
+        analyze_cron_triggers_for_24_hours(db_triggers, current_analysis_time)
+    else:
+        print("Failed to retrieve cron triggers from the database. Please check your database connection parameters and ensure the table exists.")
+
+if __name__ == "__main__":
+    main()
