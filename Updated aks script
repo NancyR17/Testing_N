@@ -1,0 +1,351 @@
+import croniter
+import datetime
+import psycopg2
+import csv
+import os
+import sys
+import smtplib # Uncommented for email alerts
+import ssl # Uncommented for email alerts
+from email.mime.text import MIMEText # Uncommented for email alerts
+from email.mime.multipart import MIMEMultipart # Uncommented for email alerts
+from typing import List, Tuple, Optional, Dict, Any
+
+# --- Configuration: Read from Environment Variables (for main DB) ---
+# For TESTING ONLY, you can hardcode these for your Dev Read-Only DB:
+# DB_HOST = "your_dev_db_host"
+# DB_PORT = "your_dev_db_port" # e.g., "5432"
+# DB_NAME = "your_dev_db_name"
+# DB_USER = "your_dev_db_user"
+# DB_PASSWORD = "your_dev_db_password"
+
+# For PRODUCTION / proper deployment, ALWAYS use environment variables / secrets:
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "your_database")
+DB_USER = os.getenv("DB_USER", "your_user")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "your_password")
+
+# --- Email Configuration (Hardcoded for testing with Port 25, No Password) ---
+# For TESTING ONLY with specific SMTP server settings:
+SMTP_SERVER = "mail.earth.com"  # Your SMTP server
+SMTP_PORT = 25                   # Your SMTP port (25 for no password often)
+SENDER_EMAIL = "your_alert_sender@earth.com" # Sender email address
+RECEIVER_EMAILS_STR = "recipient1@example.com,recipient2@example.com" # Comma-separated receiver emails
+RECEIVER_EMAILS = [email.strip() for email in RECEIVER_EMAIVER_EMAILS_STR.split(',')]
+# SENDER_PASSWORD is not needed for Port 25 without authentication
+# --- End Email Configuration ---
+
+# --- CSV Configuration ---
+CSV_FILE_NAME = "cron_quartz_sync_report.csv"
+# --- End CSV Configuration ---
+
+def calculate_cron_times(reference_time: datetime.datetime, cron_expression: str) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime]]:
+    """
+    Calculates the single previous and next fire times for a given cron expression
+    relative to a given reference_time using croniter.
+    """
+    try:
+        iter_prev = croniter.croniter(cron_expression, reference_time)
+        previous_fire_time = iter_prev.prev(datetime.datetime)
+
+        # For next fire time, start iterator from just before previous for consistency with 'next' method
+        iter_next = croniter.croniter(cron_expression, previous_fire_time)
+        next_fire_time = iter_next.next(datetime.datetime)
+        
+        return previous_fire_time, next_fire_time
+    except croniter.CroniterBadCronError:
+        print(f"Error: Invalid cron expression: {cron_expression}")
+        return None, None
+    except StopIteration: # No more occurrences
+        return None, None
+    except Exception as e:
+        print(f"Error calculating cron times for '{cron_expression}': {e}")
+        return None, None
+
+def fetch_cron_triggers_from_db(connection_params: dict) -> List[Tuple[str, str, int, Optional[datetime.datetime], Optional[datetime.datetime]]]:
+    """
+    Fetches cron trigger information from the QRTZ database tables (triggers and cron_triggers),
+    converting epoch milliseconds to datetime objects.
+    """
+    try:
+        conn = psycopg2.connect(**connection_params)
+        cursor = conn.cursor()
+        # Updated Query to JOIN phm_ntfn_qrtz_triggers and phm_ntfn_qrtz_cron_triggers
+        # 't' is alias for phm_ntfn_qrtz_triggers (for next/prev fire times)
+        # 'ct' is alias for phm_ntfn_qrtz_cron_triggers (for cron_expression)
+        cursor.execute("""
+            SELECT
+                t.trigger_name,
+                ct.cron_expression,
+                t.priority,
+                CASE
+                    WHEN t.next_fire_time IS NOT NULL THEN to_timestamp(t.next_fire_time / 1000)
+                    ELSE NULL
+                END as next_fire_time,
+                CASE
+                    WHEN t.prev_fire_time IS NOT NULL THEN to_timestamp(t.prev_fire_time / 1000)
+                    ELSE NULL
+                END as prev_fire_time
+            FROM
+                "SVC_PHM_OWNER".phm_ntfn_qrtz_triggers t
+            JOIN
+                "SVC_PHM_OWNER".phm_ntfn_qrtz_cron_triggers ct ON t.trigger_name = ct.trigger_name AND t.trigger_group = ct.trigger_group
+            WHERE
+                t.trigger_type = 'CRON'
+            ORDER BY
+                t.trigger_name;
+        """)
+        triggers = cursor.fetchall()
+        conn.close()
+        return [
+            (row[0], row[1], row[2], row[3], row[4])
+            for row in triggers
+        ]
+    except psycopg2.Error as e:
+        print(f"Error fetching QRTZ trigger data from database: {e}")
+        return []
+    except Exception as e:
+        print(f"General error fetching QRTZ trigger data: {e}")
+        return []
+
+
+def send_alert_email(subject: str, body: str) -> bool:
+    """
+    Sends an email alert.
+    """
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["From"] = SENDER_EMAIL
+        msg["To"] = ", ".join(RECEIVER_EMAILS)
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+        
+        # Determine if SSL/TLS is needed
+        if SMTP_PORT == 465: # SMTPS (SSL implicit)
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
+                # No login needed if port 25 without authentication, so SENDER_PASSWORD is not checked here
+                server.send_message(msg)
+        else: # STARTTLS (TLS explicit) or Port 25 without encryption
+            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+                server.ehlo()
+                if SMTP_PORT == 587: # Typically STARTTLS
+                    server.starttls(context=ssl.create_default_context())
+                    server.ehlo()
+                    # No login if password not provided for port 25
+                # For Port 25 without password, no login is performed here.
+                server.send_message(msg)
+        print(f"Email alert sent successfully to {', '.join(RECEIVER_EMAILS)} via {SMTP_SERVER}:{SMTP_PORT}.")
+        return True
+    except smtplib.SMTPAuthenticationError:
+        print("ERROR: Email authentication failed. Check username and password.")
+        return False
+    except smtplib.SMTPConnectError as e:
+        print(f"ERROR: Could not connect to SMTP server '{SMTP_SERVER}:{SMTP_PORT}': {e}")
+        print("Please check if the SMTP server is reachable and if your firewall allows outgoing connections on this port.")
+        return False
+    except Exception as e:
+        print(f"ERROR: Failed to send email alert: {e}")
+        return False
+
+
+def analyze_cron_quartz_sync(
+    db_triggers: List[Tuple[str, str, int, Optional[datetime.datetime], Optional[datetime.datetime]]],
+    current_analysis_time: datetime.datetime,
+) -> None:
+    """
+    Analyzes cron triggers by comparing croniter-calculated previous/next fire times
+    with Quartz's recorded prev_fire_time and next_fire_time from the database.
+    Prints detailed output to console and writes to CSV.
+    This script is intended to run frequently (e.g., every 15 minutes).
+    """
+    print("-" * 80)
+    print(f"Cron-Quartz Sync Analysis (Current Time: {current_analysis_time.isoformat()})")
+    print("-" * 80)
+    
+    csv_data: List[Dict[str, Any]] = []
+    # CSV Header
+    csv_data.append({
+        "Trigger_Name": "Trigger Name",
+        "Cron_Expression": "Cron Expression",
+        "DB_Quartz_Prev_Fire_Time": "DB Quartz Prev Fire Time (UTC)",
+        "Croniter_Calculated_Prev_Fire_Time": "Croniter Prev Fire Time (UTC)",
+        "Prev_Time_Sync_Status": "Prev Time Sync Status",
+        "DB_Quartz_Next_Fire_Time": "DB Quartz Next Fire Time (UTC)",
+        "Croniter_Calculated_Next_Fire_Time": "Croniter Next Fire Time (UTC)",
+        "Next_Time_Sync_Status": "Next Time Sync Status",
+        "Overall_Sync_Summary": "Overall Sync Summary"
+    })
+    
+    alerts_to_send = [] # Collect messages for potential email alerts (if enabled)
+    
+    # Tolerance for matching timestamps (e.g., 5 minutes for a 15-min check, adjust as needed)
+    tolerance = datetime.timedelta(minutes=5) 
+    
+    for trigger_name, cron_expression, priority, db_next_fire_time_quartz, db_prev_fire_time_quartz in db_triggers:
+        print(f"\nAnalyzing Trigger: {trigger_name}")
+        print(f"  Cron Expression: '{cron_expression}'")
+        print(f"  Priority: {priority}")
+        
+        # Calculate expected prev and next fire times using croniter based on current_analysis_time
+        croniter_prev_fire_time, croniter_next_fire_time = calculate_cron_times(current_analysis_time, cron_expression)
+        
+        prev_sync_status = "UNKNOWN"
+        next_sync_status = "UNKNOWN"
+        overall_sync_summary = "UNKNOWN"
+        
+        # --- Compare Previous Fire Times ---
+        if croniter_prev_fire_time:
+            print(f"  Croniter Calc Prev: {croniter_prev_fire_time.isoformat()}")
+            print(f"  DB Quartz Prev:   {db_prev_fire_time_quartz.isoformat() if db_prev_fire_time_quartz else 'None'}")
+            
+            if db_prev_fire_time_quartz is None:
+                prev_sync_status = "DB_QUARTZ_PREV_MISSING"
+                overall_sync_summary = "DEVIATION: DB Quartz Prev Fire Time is missing."
+            elif abs(croniter_prev_fire_time - db_prev_fire_time_quartz) <= tolerance:
+                prev_sync_status = "IN_SYNC"
+            else:
+                prev_sync_status = "PREV_TIME_MISMATCH"
+                overall_sync_summary = "DEVIATION: Prev Fire Time Mismatch."
+        else:
+            prev_sync_status = "NO_CRONITER_PREV"
+            overall_sync_summary = "INFO: Croniter cannot calculate a previous fire time."
+
+
+        # --- Compare Next Fire Times ---
+        if croniter_next_fire_time:
+            print(f"  Croniter Calc Next: {croniter_next_fire_time.isoformat()}")
+            print(f"  DB Quartz Next:   {db_next_fire_time_quartz.isoformat() if db_next_fire_time_quartz else 'None'}")
+
+            if db_next_fire_time_quartz is None:
+                next_sync_status = "DB_QUARTZ_NEXT_MISSING"
+                if "DEVIATION" not in overall_sync_summary: # Only if not already a deviation
+                    overall_sync_summary = "DEVIATION: DB Quartz Next Fire Time is missing."
+            elif abs(croniter_next_fire_time - db_next_fire_time_quartz) <= tolerance:
+                next_sync_status = "IN_SYNC"
+            else:
+                next_sync_status = "NEXT_TIME_MISMATCH"
+                if "DEVIATION" not in overall_sync_summary: # Only if not already a deviation
+                     overall_sync_summary = "DEVIATION: Next Fire Time Mismatch."
+                elif overall_sync_summary == "DEVIATION: Prev Fire Time Mismatch.":
+                     overall_sync_summary = "DEVIATION: Prev & Next Fire Time Mismatch."
+        else:
+            next_sync_status = "NO_CRONITER_NEXT"
+            if "DEVIATION" not in overall_sync_summary: # Only if not already a deviation
+                 overall_sync_summary = "INFO: Croniter cannot calculate a next fire time."
+        
+        # If no deviation was found for prev/next and both could be calculated, set to IN_SYNC
+        if overall_sync_summary == "UNKNOWN": # Means both were calculated and were in sync
+            overall_sync_summary = "SUCCESS: All in sync."
+        
+        print(f"  Prev Time Sync Status: {prev_sync_status}")
+        print(f"  Next Time Sync Status: {next_sync_status}")
+        print(f"  Overall Sync Summary: {overall_sync_summary}")
+
+        csv_data.append({
+            "Trigger_Name": trigger_name,
+            "Cron_Expression": cron_expression,
+            "DB_Quartz_Prev_Fire_Time": db_prev_fire_time_quartz.isoformat() if db_prev_fire_time_quartz else "None",
+            "Croniter_Calculated_Prev_Fire_Time": croniter_prev_fire_time.isoformat() if croniter_prev_fire_time else "None",
+            "Prev_Time_Sync_Status": prev_sync_status,
+            "DB_Quartz_Next_Fire_Time": db_next_fire_time_quartz.isoformat() if croniter_next_fire_time else "None",
+            "Croniter_Calculated_Next_Fire_Time": croniter_next_fire_time.isoformat() if croniter_next_fire_time else "None",
+            "Next_Time_Sync_Status": next_sync_status,
+            "Overall_Sync_Summary": overall_sync_summary
+        })
+        
+        if "DEVIATION" in overall_sync_summary:
+            alert_message = (f"[{trigger_name}] {overall_sync_summary}\n"
+                             f"  Cron: '{cron_expression}'\n"
+                             f"  Croniter Prev: {croniter_prev_fire_time.isoformat() if croniter_prev_fire_time else 'N/A'}\n"
+                             f"  DB Quartz Prev: {db_prev_fire_time_quartz.isoformat() if db_prev_fire_time_quartz else 'N/A'}\n"
+                             f"  Croniter Next: {croniter_next_fire_time.isoformat() if croniter_next_fire_time else 'N/A'}\n"
+                             f"  DB Quartz Next: {db_next_fire_time_quartz.isoformat() if db_next_fire_time_quartz else 'N/A'}\n")
+            alerts_to_send.append(alert_message)
+        
+        print("--------------------------------------------------------------------------------")
+    
+    # --- Write data to CSV file ---
+    if csv_data:
+        fieldnames = csv_data[0].keys() # Use keys from the header dict
+        try:
+            with open(CSV_FILE_NAME, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in csv_data[1:]: # Skip the first item which was our custom header definition
+                    writer.writerow(row)
+            print(f"\nAnalysis results written to '{CSV_FILE_NAME}' successfully.")
+        except IOError as e:
+            print(f"ERROR: Could not write CSV file '{CSV_FILE_NAME}': {e}")
+    else:
+        print("\nNo data to write to CSV.")
+
+    # --- EMAIL ALERT TRIGGERING SECTION ---
+    if alerts_to_send:
+        alert_subject = "CRON-QUARTZ SYNC ALERT: Deviations Detected!"
+        alert_body = "The following cron job synchronization deviations were detected:\n\n" + "\n\n".join(alerts_to_send)
+        alert_body += f"\n\nAnalysis performed at: {current_analysis_time.isoformat()}"
+        print("\n--- Sending Email Alert ---")
+        send_alert_email(alert_subject, alert_body)
+    else:
+        print("\nNo significant deviations detected. All cron jobs appear to be in sync with Quartz.")
+    
+    print("\n--- Analysis Complete ---")
+    print(f"Detailed report saved to '{CSV_FILE_NAME}'.")
+    print("--------------------------")
+
+def main():
+    """
+    Main function to connect to the database, fetch cron triggers, and analyze their sync status.
+    """
+    # --- Local Database Configuration (for testing) ---
+    # In AKS, these will come from environment variables / secrets
+    connection_params = {
+        "host": DB_HOST,
+        "port": DB_PORT,
+        "database": DB_NAME,
+        "user": DB_USER,
+        "password": DB_PASSWORD
+    }
+
+    # --- Check for missing essential DB environment variables (if not hardcoded) ---
+    # If you hardcode DB values directly at the top, you might adjust or temporarily disable these checks
+    required_db_env_vars = ["DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"]
+    # Check if a variable is missing AND if it's not already hardcoded at the top (by not being 'localhost'/'your_database' etc.)
+    # This is a simplified check for hardcoding. For strict hardcoding, you'd just set the vars without os.getenv()
+    # and then remove this check.
+    # For now, let's keep it simple and assume you're either hardcoding directly OR using os.getenv.
+    # If using os.getenv, the hardcoded values at the top will act as *defaults*.
+    missing_db_vars = [var for var in required_db_env_vars if not os.getenv(var)]
+    
+    # This check assumes DB_HOST, DB_NAME, etc. are populated via os.getenv or hardcoded directly
+    if not DB_HOST or not DB_NAME or not DB_USER or not DB_PASSWORD:
+        print("ERROR: Database connection parameters are not fully configured.")
+        print("Please ensure DB_HOST, DB_NAME, DB_USER, DB_PASSWORD are set via environment variables OR hardcoded at the top of the script for testing.")
+        sys.exit(1)
+
+
+    # --- Check for missing essential SMTP environment variables if not hardcoded ---
+    # This check is now simplified as SMTP config is hardcoded for testing.
+    # For production, if using ENV vars for SMTP, enable more robust checks here.
+    if not SMTP_SERVER or not SENDER_EMAIL or not RECEIVER_EMAILS_STR:
+        print("ERROR: SMTP configuration is not fully configured.")
+        print("Please ensure SMTP_SERVER, SENDER_EMAIL, RECEIVER_EMAILS_STR are set (or hardcoded for testing).")
+        sys.exit(1)
+        
+
+    # Get current time for analysis (UTC is recommended for cron checks)
+    current_analysis_time = datetime.datetime.now(datetime.timezone.utc)
+    # If your QRTZ DB times are in a specific timezone, adjust current_analysis_time accordingly
+    # e.g., current_analysis_time = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5, minutes=30))) for IST
+
+    db_triggers = fetch_cron_triggers_from_db(connection_params)
+
+    if not db_triggers:
+        print("No cron triggers fetched from database. Exiting.")
+        sys.exit(0)
+
+    analyze_cron_quartz_sync(db_triggers, current_analysis_time)
+
+if __name__ == "__main__":
+    main()
