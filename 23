@@ -1,0 +1,370 @@
+import croniter
+import datetime
+import psycopg2
+import csv
+import os
+import sys
+from typing import List, Tuple, Optional, Dict, Any
+
+# --- Configuration: Read from Environment Variables (for main DB) ---
+# For LOCAL TESTING, you can hardcode your Dev Read-Only DB credentials directly here:
+DB_HOST = "your_dev_db_host"  # <--- REPLACE with your DB Host
+DB_PORT = "5432"              # <--- REPLACE with your DB Port
+DB_NAME = "your_dev_db_name"  # <--- REPLACE with your DB Name
+DB_USER = "your_dev_db_user"  # <--- REPLACE with your DB User
+DB_PASSWORD = "your_dev_db_password" # <--- REPLACE with your DB Password
+
+# If you prefer using environment variables even for local testing,
+# uncomment these lines and comment out the hardcoded ones above:
+# DB_HOST = os.getenv("DB_HOST", "localhost")
+# DB_PORT = os.getenv("DB_PORT", "5432")
+# DB_NAME = os.getenv("DB_NAME", "your_database")
+# DB_USER = os.getenv("DB_USER", "your_user")
+# DB_PASSWORD = os.getenv("DB_PASSWORD", "your_password")
+
+# --- CSV Configuration ---
+CSV_FILE_NAME = "cron_quartz_sync_report.csv"
+# --- End CSV Configuration ---
+
+def convert_quartz_to_unix_cron(quartz_expression: str) -> Tuple[Optional[str], str]:
+    """
+    Attempts to convert a Quartz cron expression to a 5-field Unix cron expression.
+    Returns (unix_cron_expression, status_message).
+    Returns (None, error_message) if conversion is not possible or problematic.
+
+    This function handles common Quartz patterns. More complex Quartz-specific
+    features like 'L', 'W', '#', and the optional year field are noted as warnings
+    or make the conversion impossible for a direct Unix equivalent.
+    """
+    parts = quartz_expression.split()
+    
+    # Quartz cron has 6 or 7 fields: seconds, minutes, hours, day-of-month, month, day-of-week, [year]
+    # Unix cron has 5 fields: minutes, hours, day-of-month, month, day-of-week
+
+    if not (6 <= len(parts) <= 7):
+        return None, "INVALID_QUARTZ_FORMAT: Expected 6 or 7 fields."
+
+    seconds_field = parts[0]
+    minutes_field = parts[1]
+    hours_field = parts[2]
+    day_of_month_field = parts[3]
+    month_field = parts[4]
+    day_of_week_field = parts[5]
+    year_field = parts[6] if len(parts) == 7 else None
+
+    # Handle seconds field: Unix cron doesn't have seconds.
+    # If seconds is not '0' or '*', it's problematic for direct Unix conversion.
+    if seconds_field not in ['0', '*']:
+        return None, f"UNSUPPORTED_QUARTZ_SECONDS: Quartz seconds field '{seconds_field}' cannot be directly converted to Unix cron."
+    
+    # Handle Quartz '?' (no specific value)
+    # In Unix cron, this implies '*'
+    # If '?' is in both day-of-month and day-of-week, croniter might have issues, but generally it means "no specific value for this field"
+    # Unix cron typically allows only one of day-of-month or day-of-week to be '*', with the other being a specific value.
+    # However, croniter usually handles this by picking whichever is more restrictive if both are '*'.
+    # For simplicity, we just convert '?' to '*' as it often represents "any" in a Unix context.
+    if day_of_month_field == '?':
+        day_of_month_field = '*'
+    if day_of_week_field == '?':
+        day_of_week_field = '*'
+
+    # Handle Quartz 'L' (Last) and 'W' (Weekday nearest) and '#' (Nth day of week)
+    # These are not directly convertible to standard 5-field Unix cron.
+    for field in [day_of_month_field, day_of_week_field]:
+        if 'L' in field or 'W' in field or '#' in field:
+            return None, f"UNSUPPORTED_QUARTZ_FEATURE: Quartz specific operators 'L', 'W', '#' in '{field}' cannot be directly converted to Unix cron."
+
+    # Handle optional year field
+    if year_field and year_field != '*' and year_field != '?': # '?' is technically not valid for year in Quartz, but good to cover.
+        # If a specific year is set, the cron job might only run in that year,
+        # which is not representable in a 5-field Unix cron.
+        return None, f"UNSUPPORTED_QUARTZ_YEAR: Specific year '{year_field}' cannot be directly converted to Unix cron."
+    
+    # Assemble the Unix cron expression (minutes, hours, day-of-month, month, day-of-week)
+    unix_cron_expression_parts = [
+        minutes_field,
+        hours_field,
+        day_of_month_field,
+        month_field,
+        day_of_week_field
+    ]
+    
+    unix_cron_expression = " ".join(unix_cron_expression_parts)
+    return unix_cron_expression, "SUCCESS"
+
+
+def calculate_cron_times(reference_time: datetime.datetime, cron_expression: str) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime]]:
+    """
+    Calculates the single previous and next fire times for a given cron expression
+    relative to a given reference_time using croniter.
+    """
+    previous_fire_time = None
+    next_fire_time = None
+
+    # Calculate previous fire time
+    try:
+        iter_prev = croniter.croniter(cron_expression, reference_time)
+        print(f"DEBUG: Type of iter_prev: {type(iter_prev)}, Value: {iter_prev}") 
+        
+        # Assign the actual previous_fire_time here directly
+        previous_fire_time = iter_prev.get_prev(datetime.datetime) 
+        print(f"DEBUG: Croniter Calc Prev: {previous_fire_time}") # Use the assigned variable
+
+    except StopIteration:
+        # No previous fire time found before reference_time (e.g., job starts in future)
+        previous_fire_time = None
+        print(f"DEBUG: StopIteration for prev fire time for '{cron_expression}'.")
+    except croniter.CroniterBadCronError:
+        print(f"Error: Invalid cron expression for croniter (prev): '{cron_expression}'.")
+        return None, None # If cron is bad, neither can be calculated
+    except Exception as e:
+        print(f"Error calculating previous cron time for '{cron_expression}': {e}")
+        return None, None # Critical error, cannot proceed
+
+    # Calculate next fire time regardless of previous_fire_time success,
+    # as they are independent calculations relative to reference_time.
+    try:
+        iter_next = croniter.croniter(cron_expression, reference_time)
+        next_fire_time = iter_next.get_next(datetime.datetime) 
+        print(f"DEBUG: Croniter Calc Next: {next_fire_time}") # Use the assigned variable
+    except StopIteration:
+        # No next fire time found after reference_time (e.g., one-time job in past)
+        next_fire_time = None
+        print(f"DEBUG: StopIteration for next fire time for '{cron_expression}'.")
+    except croniter.CroniterBadCronError:
+        print(f"Error: Invalid cron expression for croniter (next): '{cron_expression}'.")
+        return previous_fire_time, None # Cron is bad, next is None, but return prev if it was found
+    except Exception as e:
+        print(f"Error calculating next cron time for '{cron_expression}': {e}")
+        return previous_fire_time, None # Critical error for next, but return prev if it was found
+            
+    return previous_fire_time, next_fire_time
+
+def fetch_cron_triggers_from_db(connection_params: dict) -> List[Tuple[str, str, int, Optional[datetime.datetime], Optional[datetime.datetime]]]:
+    """
+    Fetches cron trigger information from the QRTZ database tables (triggers and cron_triggers),
+    converting epoch milliseconds to datetime objects.
+    """
+    print(f"DEBUG: Attempting to connect to DB: {connection_params['host']}:{connection_params['port']}/{connection_params['database']}")
+    try:
+        conn = psycopg2.connect(**connection_params)
+        cursor = conn.cursor()
+        print("DEBUG: Successfully connected to the database.")
+        cursor.execute("""
+            SELECT
+                t.trigger_name,
+                ct.cron_expression,
+                t.priority,
+                CASE
+                    WHEN t.next_fire_time IS NOT NULL THEN to_timestamp(t.next_fire_time / 1000)
+                    ELSE NULL
+                END as next_fire_time,
+                CASE
+                    WHEN t.prev_fire_time IS NOT NULL THEN to_timestamp(t.prev_fire_time / 1000)
+                    ELSE NULL
+                END as prev_fire_time
+            FROM
+                "SVC_PHM_OWNER".phm_ntfn_qrtz_triggers t
+            JOIN
+                "SVC_PHM_OWNER".phm_ntfn_qrtz_cron_triggers ct ON t.trigger_name = ct.trigger_name AND t.trigger_group = ct.trigger_group
+            WHERE
+                t.trigger_type = 'CRON'
+            ORDER BY
+                t.trigger_name;
+        """)
+        triggers = cursor.fetchall()
+        conn.close()
+        print(f"DEBUG: Fetched {len(triggers)} cron triggers from the database.")
+        return [
+            (row[0], row[1], row[2], row[3], row[4])
+            for row in triggers
+        ]
+    except psycopg2.Error as e:
+        print(f"ERROR: Database connection or query failed: {e}")
+        return []
+    except Exception as e:
+        print(f"ERROR: General error fetching QRTZ trigger data: {e}")
+        return []
+
+
+def analyze_cron_quartz_sync(
+    db_triggers: List[Tuple[str, str, int, Optional[datetime.datetime], Optional[datetime.datetime]]],
+    current_analysis_time: datetime.datetime,
+) -> None:
+    """
+    Analyzes cron triggers by comparing croniter-calculated previous/next fire times
+    with Quartz's recorded prev_fire_time and next_fire_time from the database.
+    Prints detailed output to console and writes to CSV.
+    """
+    print("-" * 80)
+    print(f"Cron-Quartz Sync Analysis (Current Time: {current_analysis_time.isoformat()})")
+    print("-" * 80)
+    
+    csv_data: List[Dict[str, Any]] = []
+    # CSV Header (important for DictWriter)
+    csv_data.append({
+        "Trigger_Name": "Trigger Name",
+        "Original_Quartz_Cron_Expression": "Original Quartz Cron Expression",
+        "Converted_Unix_Cron_Expression": "Converted Unix Cron Expression",
+        "Conversion_Status": "Conversion Status",
+        "DB_Quartz_Prev_Fire_Time": "DB Quartz Prev Fire Time (UTC)",
+        "Croniter_Calculated_Prev_Fire_Time": "Croniter Prev Fire Time (UTC)",
+        "Prev_Time_Sync_Status": "Prev Time Sync Status",
+        "DB_Quartz_Next_Fire_Time": "DB Quartz Next Fire Time (UTC)",
+        "Croniter_Calculated_Next_Fire_Time": "Croniter Next Fire Time (UTC)",
+        "Next_Time_Sync_Status": "Next Time Sync Status",
+        "Overall_Sync_Summary": "Overall Sync Summary"
+    })
+    
+    # Tolerance for matching timestamps (e.g., 5 minutes for a 15-min check, adjust as needed)
+    tolerance = datetime.timedelta(minutes=5)  
+    
+    for trigger_name, original_cron_expression, priority, db_next_fire_time_quartz, db_prev_fire_time_quartz in db_triggers:
+        print(f"\nAnalyzing Trigger: {trigger_name}")
+        print(f"  Original Quartz Cron: '{original_cron_expression}'")
+        
+        unix_cron_expression, conversion_status = convert_quartz_to_unix_cron(original_cron_expression)
+
+        print(f"  Converted Unix Cron Pattern: '{unix_cron_expression}' (Status: {conversion_status})" if unix_cron_expression else f"  Conversion to Unix Cron FAILED: {conversion_status}")
+        print(f"  Priority: {priority}")
+
+        # Initialize these for safety, especially if conversion fails or croniter returns None
+        croniter_prev_fire_time = None
+        croniter_next_fire_time = None
+
+        if unix_cron_expression:
+            croniter_prev_fire_time, croniter_next_fire_time = calculate_cron_times(current_analysis_time, unix_cron_expression)
+        else:
+            conversion_status = f"FAILED: {conversion_status}" # Update status for CSV
+
+        # Initialize sync statuses and summary for each trigger
+        prev_sync_status = "N/A"
+        next_sync_status = "N/A"
+        overall_sync_summary = "N/A" # Default, will be updated
+
+        if unix_cron_expression: # Only proceed with sync analysis if conversion was successful
+            # --- Compare Previous Fire Times ---
+            if croniter_prev_fire_time:
+                print(f"  Croniter Calc Prev: {croniter_prev_fire_time.isoformat()}")
+                print(f"  DB Quartz Prev:   {db_prev_fire_time_quartz.isoformat() if db_prev_fire_time_quartz else 'None'}")
+                
+                prev_time_matches_croniter_prev = db_prev_fire_time_quartz and abs(croniter_prev_fire_time - db_prev_fire_time_quartz) <= tolerance
+                prev_time_matches_croniter_next = croniter_next_fire_time and db_prev_fire_time_quartz and abs(croniter_next_fire_time - db_prev_fire_time_quartz) <= tolerance
+
+                if db_prev_fire_time_quartz is None:
+                    prev_sync_status = "DB_QUARTZ_PREV_MISSING"
+                    overall_sync_summary = "DEVIATION: DB Quartz Prev Fire Time is missing."
+                elif prev_time_matches_croniter_prev:
+                    prev_sync_status = "IN_SYNC (Prev matches croniter prev)"
+                elif prev_time_matches_croniter_next:
+                    prev_sync_status = "IN_SYNC (Prev matches croniter next - job just ran)"
+                    # This indicates a good state, but overall summary will be determined after next check
+                    # Tentatively set overall_sync_summary to a success state.
+                    overall_sync_summary = "SUCCESS: Job recently executed as expected."
+                else:
+                    prev_sync_status = "PREV_TIME_MISMATCH (No match with croniter prev/next)"
+                    overall_sync_summary = f"DEVIATION: Prev Fire Time Mismatch. Expected {croniter_prev_fire_time.isoformat()} or {croniter_next_fire_time.isoformat()}, DB had {db_prev_fire_time_quartz.isoformat()}"
+            else:
+                prev_sync_status = "NO_CRONITER_PREV"
+                if db_prev_fire_time_quartz is None:
+                    overall_sync_summary = "INFO: No Prev Fire Time (DB & Croniter)."
+                else:
+                    overall_sync_summary = "DEVIATION: Croniter cannot calculate Prev."
+
+            # --- Compare Next Fire Times ---
+            if croniter_next_fire_time:
+                print(f"  Croniter Calc Next: {croniter_next_fire_time.isoformat()}")
+                print(f"  DB Quartz Next:   {db_next_fire_time_quartz.isoformat() if db_next_fire_time_quartz else 'None'}")
+
+                next_time_matches_croniter_next = db_next_fire_time_quartz and abs(croniter_next_fire_time - db_next_fire_time_quartz) <= tolerance
+
+                if db_next_fire_time_quartz is None:
+                    next_sync_status = "DB_QUARTZ_NEXT_MISSING"
+                    if "DEVIATION" not in overall_sync_summary: # Only set if not already a deviation
+                        overall_sync_summary = "DEVIATION: DB Quartz Next Fire Time is missing."
+                    else: # If prev was already a deviation, append this one
+                        overall_sync_summary += " & DB Quartz Next Missing."
+                elif next_time_matches_croniter_next:
+                    next_sync_status = "IN_SYNC"
+                    # Determine overall sync summary based on both prev and next checks
+                    if prev_sync_status == "IN_SYNC (Prev matches croniter prev)":
+                        overall_sync_summary = "SUCCESS: All cron times are in sync."
+                    elif prev_sync_status == "IN_SYNC (Prev matches croniter next - job just ran)":
+                        overall_sync_summary = "SUCCESS: Job recently executed as expected (all times align)."
+                    else: # next is IN_SYNC, but prev was a real mismatch or cannot calculate
+                        if "DEVIATION" not in overall_sync_summary:
+                            overall_sync_summary = "DEVIATION: Next Fire Time In Sync, but Prev Mismatch."
+                        else:
+                            overall_sync_summary += " & Next Fire Time In Sync (but Prev Mismatch persists)."
+                else:
+                    next_sync_status = "NEXT_TIME_MISMATCH"
+                    if "DEVIATION" not in overall_sync_summary: # Only set if not already a deviation
+                           overall_sync_summary = f"DEVIATION: Next Fire Time Mismatch. Expected {croniter_next_fire_time.isoformat()}, DB had {db_next_fire_time_quartz.isoformat()}"
+                    else: # If prev was already a deviation, append this one
+                           overall_sync_summary += f" & Next Fire Time Mismatch. Expected {croniter_next_fire_time.isoformat()}, DB had {db_next_fire_time_quartz.isoformat()}"
+            else: # croniter_next_fire_time is None
+                next_sync_status = "NO_CRONITER_NEXT"
+                if db_next_fire_time_quartz is None:
+                    if "INFO" not in overall_sync_summary and "DEVIATION" not in overall_sync_summary:
+                        overall_sync_summary = "INFO: No Croniter Next Time (DB also missing)."
+                    elif "INFO" in overall_sync_summary: # if prev was also INFO
+                        overall_sync_summary = "INFO: No Fire Times (DB & Croniter)."
+                else:
+                    if "DEVIATION" not in overall_sync_summary:
+                        overall_sync_summary = "DEVIATION: Croniter cannot calculate Next (DB has one)."
+                    else:
+                        overall_sync_summary += " & Croniter cannot calculate Next (DB has one)."
+
+            # Final fallback check for overall sync summary if still default (N/A) from initial state
+            if overall_sync_summary == "N/A":
+                overall_sync_summary = "SUCCESS: All aspects checked are in sync."
+        else: # Conversion failed
+            prev_sync_status = "N/A_CONVERSION_FAILED"
+            next_sync_status = "N/A_CONVERSION_FAILED"
+            overall_sync_summary = "CONVERSION_FAILED"
+
+        print(f"  Prev Time Sync Status: {prev_sync_status}")
+        print(f"  Next Time Sync Status: {next_sync_status}")
+        print(f"  Overall Sync Summary: {overall_sync_summary}")
+
+        # Append data to CSV - ensure all values are strings or "None"/"N/A"
+        csv_data.append({
+            "Trigger_Name": trigger_name,
+            "Original_Quartz_Cron_Expression": original_cron_expression,
+            "Converted_Unix_Cron_Expression": unix_cron_expression if unix_cron_expression else "N/A",
+            "Conversion_Status": conversion_status,
+            "DB_Quartz_Prev_Fire_Time": db_prev_fire_time_quartz.isoformat() if db_prev_fire_time_quartz else "None",
+            "Croniter_Calculated_Prev_Fire_Time": croniter_prev_fire_time.isoformat() if croniter_prev_fire_time else "None",
+            "Prev_Time_Sync_Status": prev_sync_status,
+            "DB_Quartz_Next_Fire_Time": db_next_fire_time_quartz.isoformat() if db_next_fire_time_quartz else "None",
+            "Croniter_Calculated_Next_Fire_Time": croniter_next_fire_time.isoformat() if croniter_next_fire_time else "None",
+            "Next_Time_Sync_Status": next_sync_status,
+            "Overall_Sync_Summary": overall_sync_summary
+        })
+        
+        print("--------------------------------------------------------------------------------")
+    
+    # --- Write data to CSV file ---
+    if csv_data:
+        fieldnames = csv_data[0].keys() # Get headers from the first item (which is our custom header row)
+        try:
+            with open(CSV_FILE_NAME, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in csv_data[1:]: # Skip the first item which was our custom header definition
+                    writer.writerow(row)
+            print(f"\nAnalysis results written to '{CSV_FILE_NAME}' successfully.")
+        except IOError as e:
+            print(f"ERROR: Could not write CSV file '{CSV_FILE_NAME}': {e}")
+    else:
+        print("\nNo data to write to CSV.")
+            
+    print("\n--- Analysis Complete ---")
+    print(f"Detailed report saved to '{CSV_FILE_NAME}'.")
+    print("--------------------------")
+
+def main():
+    """
+    Main function to connect to the database, fetch cron triggers, and analyze their sync status.
+    """
+    print
