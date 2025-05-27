@@ -383,4 +383,28 @@ def main():
         "password": DB_PASSWORD
     }
 
- 
+     # --- Check for missing essential DB environment variables ---
+    # This simplified check ensures your hardcoded values are not empty
+    if not DB_HOST or not DB_NAME or not DB_USER or not DB_PASSWORD:
+        print("ERROR: Database connection parameters are not fully configured.")
+        print(f"DB_HOST: '{DB_HOST}', DB_NAME: '{DB_NAME}', DB_USER: '{DB_USER}', DB_PASSWORD: {'*' * len(DB_PASSWORD) if DB_PASSWORD else 'None'}")
+        print("Please ensure DB_HOST, DB_NAME, DB_USER, DB_PASSWORD are filled in the script.")
+        print("DEBUG: Exiting due to incomplete DB configuration.")
+        sys.exit(1)
+        
+    print("DEBUG: DB parameters appear configured. Proceeding to fetch triggers.")
+
+    # Get current time for analysis (UTC is recommended for cron checks)
+    current_analysis_time = datetime.datetime.now(datetime.timezone.utc)
+
+    db_triggers = fetch_cron_triggers_from_db(connection_params)
+
+    if not db_triggers:
+        print("No cron triggers fetched from database. Exiting.")
+        sys.exit(0)
+
+    analyze_cron_quartz_sync(db_triggers, current_analysis_time)
+
+if __name__ == "__main__":
+    main()
+
