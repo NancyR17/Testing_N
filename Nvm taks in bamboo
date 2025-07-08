@@ -1,0 +1,29 @@
+#!/bin/bash
+
+echo "--- Debugging NVM Path ---"
+echo "Current HOME directory: $HOME"
+echo "Expected NVM_DIR: $HOME/.nvm"
+echo "Does NVM_DIR exist? [ -d "$HOME/.nvm" ] && echo 'Yes' || echo 'No'"
+echo "Does nvm.sh exist? [ -s "$HOME/.nvm/nvm.sh" ] && echo 'Yes' || echo 'No'"
+echo "--- Attempting to load NVM capabilities ---"
+
+# Set the NVM directory path
+export NVM_DIR="$HOME/.nvm"
+# Load NVM's main script
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+echo "--- Verifying NVM loading ---"
+nvm --version || echo "NVM command still not found after sourcing." # Check if nvm command is now available
+
+echo "--- Switching to Node.js v22.13.1 ---"
+nvm use v22.13.1
+
+echo "--- Verifying active Node.js versions ---"
+node -v
+npm -v
+
+echo "--- Running npm install ---"
+npm install --force
+
+echo "--- Running npm build ---"
+npm run devbuild
