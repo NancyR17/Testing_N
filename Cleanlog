@@ -1,0 +1,93 @@
+import subprocess
+import datetime
+import sys
+
+# --- Configuration ---
+NAMESPACE = "default"
+# Recommended: Use a label selector for robustness.
+# Based on your image, this looks like a strong candidate for the label.
+POD_SELECTOR_LABEL_KEY = "app.kubernetes.io/instance" # or "app.kubernetes.io/name"
+POD_SELECTOR_LABEL_VALUE = "singapore-algorithm-execution-client"
+
+# Fallback/alternative if you prefer name prefix (less robust)
+# POD_NAME_PREFIX = "singapore-algorithm-execution-client-"
+
+TO_CLEAN_DIR = "/App/project/Algorithm-execution" # Corrected the directory name based on your image
+KEEP_DAYS = 7 # Keep logs for 7 days; delete logs older than this.
+# --- End Configuration ---
+
+def run_command(command, input_data=None):
+    """Helper function to run shell commands and capture output."""
+    try:
+        process = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=True,
+            input=input_data,
+            shell=True
+        )
+        return process.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: Command failed: {e.cmd}")
+        print(f"Return Code: {e.returncode}")
+        print(f"STDOUT: {e.stdout}")
+        print(f"STDERR: {e.stderr}")
+        sys.exit(e.returncode)
+    except FileNotFoundError:
+        print("ERROR: 'kubectl' command not found. Ensure kubectl is in your system PATH or provide its full path.")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{current_time}: Starting Kubernetes log cleaning script.")
+
+    # 1. Find the name of a running pod using the label selector
+    print(f"{current_time}: Searching for pod with label '{POD_SELECTOR_LABEL_KEY}={POD_SELECTOR_LABEL_VALUE}' in namespace '{NAMESPACE}'.")
+    try:
+        # Using label selector to find a running pod
+        find_pod_cmd = f'kubectl get pods -n {NAMESPACE} --field-selector=status.phase=Running -l {POD_SELECTOR_LABEL_KEY}={POD_SELECTOR_LABEL_VALUE} -o jsonpath="{{.items[0].metadata.name}}"'
+        found_pod_name = run_command(find_pod_cmd)
+        
+        if not found_pod_name:
+            print(f"{current_time}: ERROR: No running pod found with label '{POD_SELECTOR_LABEL_KEY}={POD_SELECTOR_LABEL_VALUE}'. Please check labels or pod status. Exiting.")
+            sys.exit(1)
+
+        print(f"{current_time}: Found pod: '{found_pod_name}'. Proceeding to execute log cleaning script inside it.")
+
+    except Exception as e:
+        print(f"{current_time}: ERROR: Failed to find pod due to an unexpected issue: {e}")
+        sys.exit(1)
+
+    # 2. Define the Bash command to be executed *inside* the pod.
+    inner_bash_command = f"""find {TO_CLEAN_DIR} -type f -mtime +{KEEP_DAYS} -print -delete"""
+
+    # 3. Execute the Bash command inside the pod using `kubectl exec`.
+    print(f"{current_time}: Executing log cleaning command inside pod '{found_pod_name}'.")
+    try:
+        kubectl_exec_cmd_list = [
+            "kubectl", "exec",
+            "-i",
+            found_pod_name,
+            "-n", NAMESPACE,
+            "--", "/bin/sh", "-c",
+            inner_bash_command
+        ]
+        
+        result_from_pod = subprocess.run(
+            kubectl_exec_cmd_list,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        print(f"{current_time}: Output from pod:\n{result_from_pod.stdout.strip()}")
+        print(f"{current_time}: Log cleaning completed successfully for pod '{found_pod_name}'.")
+
+    except subprocess.CalledProcessError as e:
+        print(f"{current_time}: ERROR: Log cleaning command failed in pod '{found_pod_name}'.")
+        print(f"STDOUT from pod:\n{e.stdout.strip()}")
+        print(f"STDERR from pod:\n{e.stderr.strip()}")
+        sys.exit(e.returncode)
+    except Exception as e:
+        print(f"{current_time}: An unexpected error occurred during command execution: {e}")
+        sys.exit(1)
