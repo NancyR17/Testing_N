@@ -1,0 +1,62 @@
+#!/bin/bash
+
+# --- Configuration (will be passed via environment variables from CronJob) ---
+NAMESPACE="${NAMESPACE:-default}" # Default to 'default' if not set
+# Corrected based on your provided image (app.kubernetes.io/instance label)
+POD_SELECTOR_LABEL_KEY="${POD_SELECTOR_LABEL_KEY:-app.kubernetes.io/instance}"
+POD_SELECTOR_LABEL_VALUE="${POD_SELECTOR_LABEL_VALUE:-singapore-algorithm-execution-client}"
+# Corrected directory path based on your previous input '/App/project/Algorithm-execution'
+TO_CLEAN_DIR="${TO_CLEAN_DIR:-/App/project/Algorithm-execution}"
+KEEP_DAYS="${KEEP_DAYS:-7}" # Default to 7 days if not set
+# --- End Configuration ---
+
+echo "$(date): Starting Kubernetes log cleaning script (in-cluster, shell-based)."
+
+# 1. Find the names of ALL running pods using the label selector.
+echo "$(date): Searching for ALL running pods with label \"$POD_SELECTOR_LABEL_KEY=$POD_SELECTOR_LABEL_VALUE\" in namespace \"$NAMESPACE\"."
+
+# Use kubectl to find all pod names based on the label selector
+# We'll get a space-separated list of names
+POD_NAMES=$(kubectl get pods -n "$NAMESPACE" --field-selector=status.phase=Running -l "$POD_SELECTOR_LABEL_KEY"="$POD_SELECTOR_LABEL_VALUE" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+
+if [ -z "$POD_NAMES" ]; then
+    echo "$(date): ERROR: No running pods found with label \"$POD_SELECTOR_LABEL_KEY=$POD_SELECTOR_LABEL_VALUE\". Please check labels or pod status. Exiting."
+    exit 1
+fi
+
+echo "$(date): Found pods: $POD_NAMES"
+
+# 2. Define the Bash command to be executed *inside* each target pod.
+# This command uses the 'find' utility to locate and delete old files.
+INNER_BASH_COMMAND="find \"$TO_CLEAN_DIR\" -type f -mtime +$KEEP_DAYS -print -delete"
+
+# 3. Iterate through each found pod and execute the command.
+SUCCESS_COUNT=0
+FAILURE_COUNT=0
+
+for POD_NAME in $POD_NAMES; do
+    echo "$(date): Executing log cleaning command inside pod \"$POD_NAME\"."
+    
+    # Run kubectl exec and capture its output/errors
+    kubectl exec -i "$POD_NAME" -n "$NAMESPACE" -- /bin/sh -c "$INNER_BASH_COMMAND"
+
+    # Check the exit status of the kubectl exec command
+    if [ $? -ne 0 ]; then
+        echo "$(date): ERROR: Log cleaning command failed for pod \"$POD_NAME\"."
+        FAILURE_COUNT=$((FAILURE_COUNT + 1))
+    else
+        echo "$(date): Log cleaning completed successfully for pod \"$POD_NAME\"."
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    fi
+done
+
+echo "$(date): Log cleaning process completed."
+echo "$(date): Summary: Successfully cleaned $SUCCESS_COUNT pods, failed to clean $FAILURE_COUNT pods."
+
+if [ "$FAILURE_COUNT" -gt 0 ]; then
+    echo "$(date): Script finished with failures."
+    exit 1 # Exit with error if any pod failed
+else
+    echo "$(date): Script finished successfully for all pods."
+    exit 0 # Exit successfully if all pods were cleaned
+fi
