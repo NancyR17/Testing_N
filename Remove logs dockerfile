@@ -1,0 +1,33 @@
+# Use Alpine Linux as the base image. It's extremely lightweight and secure.
+FROM alpine:3.18
+
+# Install necessary packages:
+# bash: Required to execute your 'clean_pod_logs.sh' shell script.
+#       --no-cache: Reduces image size by preventing apk from caching package indexes.
+RUN apk add --no-cache bash
+
+# --- IMPORTANT: Copy kubectl from your local build context into the image ---
+# This is the crucial step for air-gapped or restricted network environments.
+# Ensure the 'kubectl' binary (Linux amd64 version) is placed in the same directory
+# as this Dockerfile BEFORE you build the image.
+COPY kubectl /usr/local/bin/kubectl
+
+# Make the copied kubectl binary executable.
+# This permission is essential for the script to be able to run kubectl commands.
+RUN chmod +x /usr/local/bin/kubectl
+
+# Set the working directory inside the container.
+# All subsequent commands (like COPY for your script) will be relative to this directory.
+WORKDIR /app
+
+# Copy your log cleaning shell script into the container's /app directory.
+# Ensure 'clean_pod_logs.sh' is in the same directory as the Dockerfile.
+COPY clean_pod_logs.sh .
+
+# Make the copied script executable.
+# This permission is necessary for the container to run your script.
+RUN chmod +x clean_pod_logs.sh
+
+# This defines the default command that will be executed when a container starts from this image.
+# It tells the container to run your log cleaning shell script.
+CMD ["./clean_pod_logs.sh"]
