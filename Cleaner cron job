@@ -1,0 +1,38 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: in-cluster-log-cleaner # A unique name for your CronJob
+  namespace: default # The namespace where your target pods are running (e.g., singapore-algorithm-execution-client)
+spec:
+  schedule: "0 2 * * *" # This schedules the job to run daily at 2:00 AM (UTC/cluster time)
+  concurrencyPolicy: Forbid # Ensures that if a previous job is still running, a new one won't start
+  successfulJobsHistoryLimit: 3 # Keeps the last 3 successful job runs in Kubernetes history
+  failedJobsHistoryLimit: 1 # Keeps the last 1 failed job run in Kubernetes history
+  jobTemplate: # Defines the Job that will be created by the CronJob
+    spec:
+      template:
+        spec:
+          # IMPORTANT: This ServiceAccount needs permissions to 'get' pods and 'exec' into them.
+          # The 'default' service account might work out-of-the-box in some clusters,
+          # but in production, you typically create a specific Role and RoleBinding for security.
+          serviceAccountName: default 
+
+          containers:
+          - name: log-cleaner-shell-container # Name of the container within the Job's pod
+            image: your-registry/log-cleaner:latest # <--- REPLACE THIS with the actual name of your built and pushed Docker image!
+            imagePullPolicy: Always # Always pulls the latest version of your image to ensure updates are picked up
+
+            # Pass configuration values as environment variables to your shell script inside the container.
+            env:
+            - name: NAMESPACE
+              value: "default" # Namespace of the target pods
+            - name: POD_SELECTOR_LABEL_KEY
+              value: "app.kubernetes.io/instance" # The label key used to select your pods
+            - name: POD_SELECTOR_LABEL_VALUE
+              value: "singapore-algorithm-execution-client" # The label value used to select your pods
+            - name: TO_CLEAN_DIR
+              value: "/App/project/Algorithm-execution" # The exact directory path inside your target pods
+            - name: KEEP_DAYS
+              value: "7" # Number of days to keep logs (files older than this will be deleted)
+
+          restartPolicy: OnFailure # If the container within the Job fails, the Job will retry the pod
