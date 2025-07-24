@@ -1,0 +1,40 @@
+# Compiled/Build Artifacts
+*.class
+*.o
+*.pyc
+*.swp
+target/
+build/
+dist/
+node_modules/
+venv/
+*.jar
+*.war
+*.ear
+
+# Version Control
+.git/
+.gitignore
+.svn/
+.hg/
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.iml
+*.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+tmp/
+
+# Test data or large static assets not needed in the deployed image
+testdata/
+docs/
+large-static-files/
+
+# Helm specific ignore (generally not needed as it's default)
+.helmignore
