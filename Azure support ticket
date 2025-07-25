@@ -1,0 +1,105 @@
+Here is the complete step-by-step guide to create a support ticket in the Azure Portal, using the draft you prepared.
+
+Step 1: Log in to the Azure Portal
+
+Open your web browser and go to the Azure Portal: https://portal.azure.com
+
+Log in using your Azure credentials.
+
+Step 2: Navigate to "Help + support"
+
+In the Azure Portal's left-hand navigation menu, scroll down and click on "Help + support".
+
+If you don't see it directly, you can also type "Help + support" in the search bar at the top.
+
+Step 3: Click "Create a support request"
+
+On the "Help + support" page, you will see a large blue button or link that says "Create a support request". Click on it.
+
+Step 4: Fill in the "Basics" tab
+This is the first step of creating the ticket.
+
+Issue type: Select "Technical" from the dropdown.
+
+Subscription: Choose the Azure Subscription for which you need support and which has your "Premier" support plan.
+
+Service:
+
+Service type: Select "Kubernetes Service (AKS)" from the dropdown.
+
+Service: Select the specific name of your AKS cluster (e.g., [YourDevAksClusterName]).
+
+Problem type: Select "Cluster Management" or "API Server" from the dropdown. (If "API Server" is not available, "Cluster Management" is the most appropriate).
+
+Problem subtype: Choose something like "Other Cluster Issues" or "Deployment Issues".
+
+Severity: Select the severity of your issue here.
+
+C - Minimal business impact: If this only affects development workflows and you have a working workaround.
+
+B - Moderate business impact: If this significantly hinders your development velocity or CI/CD pipeline for Dev.
+
+Click the "Next: Solutions >>" button. (Azure might suggest some potential solutions, but you can proceed to the next step for your specific issue).
+
+Step 5: Fill in the "Details" tab
+This is where you provide the detailed description of your problem.
+
+Problem details:
+
+Provide a clear description: Copy and paste the professional draft you prepared here. Make sure to fill in all the [ ] placeholders with your specific information (e.g., cluster names, resource groups, your company's name, etc.).
+
+**Subject:** **[Your Subscription Name] - AKS Dev Cluster: Helm Deployment Failure - "Request entity too large: limit is 3145728"**
+
+**Problem Description:**
+
+We are consistently encountering a "Request entity too large" error when attempting to deploy our microservices using `helm upgrade --install` commands in our Azure Kubernetes Service (AKS) Development cluster. The exact error message received is: `Error: Request entity too large: limit is 3145728`.
+
+**Context:**
+Our application consists of 8 independent microservices, each managed by its own dedicated Helm chart. We deploy these microservices sequentially using individual `helm upgrade --install` commands (e.g., `helm upgrade mercury-web-api ./mercury-web-api`).
+
+**Observed Behavior:**
+1.  **In Dev AKS Cluster:** When we execute `helm upgrade --install` for any of our microservice charts, the operation fails with the aforementioned "Request entity too large" error. This indicates that the payload size of the Helm release object (which is stored as a Kubernetes Secret/ConfigMap) exceeds the API server's configured limit of approximately 3 MB.
+2.  **In QA and Production AKS Clusters:** The exact same Helm charts and deployment process (using identical `helm upgrade --install` commands) execute successfully without any size-related errors. This suggests a potential difference in the API server or etcd configuration between our Dev environment and our QA/Production environments.
+
+**Troubleshooting Steps Taken:**
+1.  **Rendered Manifest Size Check:** We used `helm template <chart-name> ./<chart-name>` for each microservice chart. The resulting YAML output is consistently very small (approximately 2-3 KB per microservice), indicating that the final Kubernetes resources themselves are not excessively large.
+2.  **Packaged Chart Size Check:** We used `helm package .` within each microservice chart's directory. The resulting `.tgz` package size for each chart is consistently around **2 MB to 2.1 MB**. This packaged `.tgz` file is part of the Helm release object stored in Kubernetes.
+3.  **Helmignore Optimization:** We have extensively reviewed and optimized the `.helmignore` files for all our microservice charts, excluding build artifacts (`node_modules/`, `target/`, `build/`, `dist/`), test data, documentation, and other non-essential files to minimize the packaged `.tgz` size. Despite these efforts, the size remains around 2-2.1 MB, which appears to be the irreducible minimum for our essential chart components.
+
+**Current Workaround:**
+As a temporary measure, we are currently bypassing `helm upgrade` in Dev by using `helm template <chart> | kubectl apply -f -`. While this allows deployments, it disables critical Helm features such as release tracking, rollbacks, and intelligent upgrade strategies, which is not sustainable for long-term development.
+
+**Request:**
+We kindly request your assistance in investigating the following:
+1.  Could you please confirm the exact `max-request-bytes` limit configured for the Kubernetes API server and etcd for our **Development AKS cluster: `[YourDevAksClusterName]` (Resource Group: `[YourDevResourceGroup]`)**?
+2.  Please compare this limit with our **QA AKS cluster: `[YourQaAksClusterName]` (Resource Group: `[YourQaResourceGroup]`)** and **Production AKS cluster: `[YourProdAksClusterName]` (Resource Group: `[YourProdResourceGroup]`)**.
+3.  We would like to understand if it is possible to adjust or increase this `max-request-bytes` limit for our Development AKS cluster. If so, what are the recommended procedures and any potential implications?
+4.  Alternatively, if increasing the limit is not feasible, please provide any best practices or recommended strategies within AKS for deploying Helm charts with packaged sizes in the 2MB range.
+
+File upload: Here, attach the screenshots you shared with me:
+
+IMG_20250724_112358.jpg (Showing the "Request entity too large" error message)
+
+IMG20250724113408.jpg (Showing the commented-out Helm commands and the workaround)
+
+Any other relevant screenshots of du -sh output for your packaged charts if you have them.
+
+Support method:
+
+Preferred contact method: Choose "Email" or "Phone", whichever is convenient for you.
+
+Severity: (This will be pre-filled, but you can double-check it here).
+
+Availability: Provide your availability times (along with your time zone).
+
+Step 6: Click on the "Review + create" tab
+
+Review all the information you have filled in. Ensure everything is accurate and clear.
+
+Step 7: Click the "Create" button
+
+Once you are satisfied, click the "Create" button to submit the support ticket.
+
+After submitting the ticket, you will receive a support ticket ID, and the Azure support team will contact you. With Premier support, you should expect a prompt and dedicated response from an Azure technical engineer.
+
+Good luck!
