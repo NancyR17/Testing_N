@@ -1,0 +1,48 @@
+---
+**Jira Task: VM General HTTPS Connectivity Issue**
+---
+
+**Task Type:** Bug / Incident / Infrastructure Request (Choose what fits your company's Jira workflow)
+
+**Summary/Title:** VM: Outbound HTTPS Connections Failing (SSL_ERROR_SYSCALL - Network Blockage)
+
+**Description:**
+
+My Red Hat VM ([Your VM's IP Address Here - e.g., 10.0.0.X]) is unable to establish any outbound HTTPS connections. This is preventing the use of critical development tools that rely on HTTPS for package downloads, source control, and other services.
+
+**Symptoms:**
+* `curl -v https://www.google.com` consistently fails with `SSL_ERROR_SYSCALL`.
+* `openssl s_client -connect ...` also fails at the "Client Hello" stage with `SSL_connect:error in SSLv3/TLS write client hello` and `errno=104` (Connection reset by peer).
+* This failure occurs regardless of the TLS version specified (e.g., TLSv1.2 also fails at this stage).
+* The `SSL handshake has read 0 bytes`, indicating the connection is terminated before any server certificate is received.
+
+**Troubleshooting Performed:**
+1.  Confirmed corporate Root and Intermediate CA certificates are successfully installed on the VM and working for `npm` within the pipeline (proving certificate trust is established on the VM for applications that can complete the handshake).
+2.  Verified no local firewall on VM is blocking traffic.
+
+**Conclusion:**
+The issue is a **network-level blockage** that is prematurely terminating the SSL/TLS handshake for all outbound HTTPS traffic from this VM's IP address. This is not a certificate trust issue on the VM.
+
+**Proposed Solution (for Network/Infra Team):**
+Please investigate and configure relevant network devices (firewalls, proxies, security appliances) to **whitelist outbound HTTPS (port 443) traffic from [Your VM's IP Address]**. This may involve:
+* Whitelisting the VM's IP address(es).
+* Bypassing SSL inspection for this VM's traffic.
+* Adjusting specific firewall rules for port 443.
+
+**Affected Tools/Services (examples):**
+* Node.js / npm
+* JDK / Maven / Gradle
+* Trivy
+* Git (GitHub access)
+* `curl`, `wget`
+
+**Priority:** High (Blocking development work on VM)
+
+**Assignee:** [Assign to relevant Network/Infra team or lead]
+
+**Attachments:**
+* `IMG_20250722_145931.jpg` (curl -v output)
+* `IMG20250722150317.jpg` (openssl s_client output)
+* `IMG20250722153323.jpg` (openssl s_client -tls1_2 output)
+
+---
