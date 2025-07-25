@@ -1,1 +1,42 @@
+*** DOCUMENT START ***
 
+---
+**1. Jira Task: QA Pipeline Failure - Certificate Resolution**
+---
+
+**Task Type:** Bug / Improvement / DevOps Task (Choose what fits your company's Jira workflow)
+
+**Summary/Title:** QA Pipeline Failure: `SELF_SIGNED_CERT_IN_CHAIN` during `npm` operations - RESOLVED
+
+**Description:**
+
+This task addresses the `SELF_SIGNED_CERT_IN_CHAIN` error encountered in the QA environment pipeline during `npm` operations (e.g., `npm install`). This error prevented the pipeline from successfully building/deploying.
+
+**Problem Identified:**
+The pipeline was failing in the QA environment with `SELF_SIGNED_CERT_IN_CHAIN`. This indicated that the Node.js/npm process running within the QA pipeline agent was unable to trust the SSL certificates presented by internal services (likely `artifacts.auth.products.abbott` for npm packages).
+
+**Resolution:**
+The issue was resolved by installing the corporate Root CA and Intermediate CA certificates onto the VM acting as the QA pipeline agent. This ensures the system-wide trust store includes the necessary corporate certificates.
+
+**Certificate Installation Process on QA Pipeline VM:**
+1.  Requested necessary corporate Root CA and Intermediate CA certificates (.cer files).
+2.  Copied these `.cer` files to the QA pipeline VM (e.g., via SCP).
+3.  Installed the certificates into the system's trust store using the following commands:
+    ```bash
+    # (Assuming .cer files were placed in a temp location, e.g., /home/user/)
+    sudo cp PT_intermediate.cer /etc/pki/ca-trust/source/anchors/
+    sudo cp PT_root.cer /etc/pki/ca-trust/source/anchors/
+    sudo update-ca-trust extract
+    ```
+4.  Confirmed `npm` configuration on the QA VM:
+    * `npm config strict-ssl` was verified to be `true` (no `false` override was present).
+    * `npm config ca` was `null` (default behavior, relying on system CAs).
+
+**Outcome:**
+After the certificate installation on the QA pipeline VM, the **QA environment pipeline is now running successfully**, no longer encountering the `SELF_SIGNED_CERT_IN_CHAIN` error during `npm` operations.
+
+**Affected Environments:** QA Pipeline.
+**Resolution Steps:** Certificate installation on QA pipeline VM.
+
+**Attachments:**
+*(You can manually attach relevant screenshots like IMG_20250723_142358.jpg if helpful
