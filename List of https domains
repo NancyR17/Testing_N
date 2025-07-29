@@ -1,0 +1,30 @@
+https://registry.npmjs.org
+https://unpkg.com
+https://cdn.jsdelivr.net
+https://repo.maven.apache.org
+https://repo1.maven.org
+https://plugins.gradle.org
+https://services.gradle.org
+https://jcenter.bintray.com
+https://pypi.org
+https://files.pythonhosted.org
+https://github.com
+https://raw.githubusercontent.com
+https://api.github.com
+https://gist.github.com
+https://ghcr.io
+https://aquasecurity.github.io
+https://registry-1.docker.io
+https://index.docker.io
+https://production.cloudflare.docker.com
+https://gcr.io
+https://quay.io
+https://cdn.redhat.com
+https://downloads.fedoraproject.org
+https://mirrors.centos.org
+https://repo.saltstack.com
+https://packages.microsoft.com
+https://www.google.com
+https://artifacts.auth.products.abbott
+# Add any other internal Maven/Gradle/Git repositories relevant to your team here (e.g., https://your-internal-nexus.corp.com, https://gitlab.yourcorp.com)
+# Add any other custom internal DNF/YUM repositories you use here
