@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: react-ui-deployment
+  labels:
+    app: react-ui
+spec:
+  replicas: 2 # Default mein 2 replicas set kiye gaye hain
+  selector:
+    matchLabels:
+      app: react-ui
+  template:
+    metadata:
+      labels:
+        app: react-ui
+    spec:
+      containers:
+      - name: react-ui
+        image: your-ui-app-name:latest # Yahan apne Docker image ka naam aur tag daalein
+        ports:
+        - containerPort: 80 # Dockerfile mein expose kiya gaya port
+        resources:
+          limits:
+            cpu: "250m" # CPU limit set karein
+            memory: "256Mi" # Memory limit set karein
+          requests:
+            cpu: "100m" # CPU request set karein
+            memory: "128Mi" # Memory request set karein
+      serviceAccountName: react-ui-sa
+      
