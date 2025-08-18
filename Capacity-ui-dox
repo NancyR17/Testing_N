@@ -1,0 +1,177 @@
+UI Deployment and Kubernetes GuideThis document provides a complete checklist and all the necessary commands and configuration files to deploy your UI to a Kubernetes cluster.Step 1: Clone the Repository & Create a Feature BranchFirst, you'll need to clone the repository to your local machine and create a new feature branch to work on.# Clone the repository (replace with your repo URL)
+git clone https://github.com/your-org/your-ui-repo.git
+
+# Navigate into the cloned directory
+cd your-ui-repo
+
+# Create and switch to a new feature branch
+git checkout -b feature/your-new-feature
+Step 2: Create a DockerfileThe Dockerfile is a script that tells Docker how to build your application's image. This example uses a multi-stage build, which is a best practice for creating small, efficient images.Dockerfile# --- STAGE 1: Build the UI application ---
+# Use a Node.js base image with Alpine Linux for a small footprint.
+FROM node:22-alpine AS node
+
+# Set the working directory inside the container.
+WORKDIR /app
+
+# Copy the package.json and package-lock.json files to leverage Docker's layer caching.
+# This ensures npm install runs only when your dependencies change.
+COPY package*.json ./
+
+# Install all the project dependencies.
+RUN npm install
+
+# Copy the entire source code into the container.
+COPY . .
+
+# Build the UI application for production.
+RUN npm run build
+
+# --- STAGE 2: Serve the application with Nginx ---
+# Use an official Nginx image with Alpine Linux for a lightweight web server.
+FROM nginx:1.25.1-alpine
+
+# Copy the built UI application from the 'node' stage to the Nginx web server directory.
+# The 'from=node' flag indicates we're copying from the first stage.
+# The path /usr/share/nginx/html is the default Nginx web root.
+COPY --from=node /app/dist /usr/share/nginx/html
+
+# Expose port 80 to the outside world. This is the port Nginx will listen on.
+EXPOSE 80
+
+# The default command to run Nginx in the foreground. This is required for Docker containers.
+# The '-g' flag sets global configuration directives.
+CMD ["nginx", "-g", "daemon off;"]
+Step 3: Build, Tag, and Push the Docker ImageAfter creating the Dockerfile, you'll build your application's image, tag it, and push it to your Azure Container Registry (ACR).# Log in to your Azure Container Registry
+# The credentials below are from the image you provided
+az acr login --name acrbscaasdev.azurecr.io
+docker login -u dladmracaasr21 -p <your_acr_password> acrbscaasdev.azurecr.io
+
+# Build the Docker image locally
+# The '-t' flag tags the image with a name and version (v1.1)
+docker build -t capacity-iq-ui:v1.1 .
+
+# Tag the image for ACR, using your full registry path
+# This creates a second tag that points to the same image
+docker tag capacity-iq-ui:v1.1 acrbscaasdev.azurecr.io/capacity-iq/capacity-iq-ui:v1.1
+
+# Push the tagged image to ACR
+docker push acrbscaasdev.azurecr.io/capacity-iq/capacity-iq-ui:v1.1
+Step 4: Create a Secret for ACR AccessThis secret allows your Kubernetes cluster to pull images from your private registry.# This command creates a secret for the docker registry
+# The credentials used here are from the image you provided
+kubectl create secret docker-registry regcred \
+  --namespace=ns-capacity-iq-d \
+  --docker-server=acrbscaasdev.azurecr.io \
+  --docker-username=dladmracaasr21 \
+  --docker-password=hjwuwuwuwu
+Step 5: Create Kubernetes ManifestsThese are the configuration files that define your application's components in Kubernetes.deployment.yamlThis manifest defines the Pod that runs your application.apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: capacity-iq-ui-deployment
+  namespace: ns-capacity-iq-d
+  labels:
+    app: capacity-iq-ui
+spec:
+  replicas: 1 # The number of pods to run
+  selector:
+    matchLabels:
+      app: capacity-iq-ui
+  template:
+    metadata:
+      labels:
+        app: capacity-iq-ui
+    spec:
+      containers:
+      - name: capacity-iq-ui
+        # The image from ACR that we just pushed
+        image: acrbscaasdev.azurecr.io/capacity-iq/capacity-iq-ui:v1.1
+        ports:
+        - containerPort: 80 # The port the container exposes (from the Dockerfile)
+        resources:
+          limits:
+            cpu: "250m"   # Max CPU limit
+            memory: "256Mi" # Max memory limit
+          requests:
+            cpu: "100m"   # Guaranteed CPU request
+            memory: "128Mi" # Guaranteed memory request
+      imagePullSecrets:
+      - name: regcred # The secret that contains ACR credentials
+      serviceAccountName: capacity-iq-ui-sa
+service.yamlThis manifest creates a Service to expose your deployment inside the cluster.apiVersion: v1
+kind: Service
+metadata:
+  name: capacity-iq-ui-service
+  namespace: ns-capacity-iq-d
+  labels:
+    app: capacity-iq-ui
+spec:
+  selector:
+    app: capacity-iq-ui # Selects the pods created by the deployment
+  ports:
+  - protocol: TCP
+    port: 80          # The service's port
+    targetPort: 80    # The port on the pod to forward traffic to
+  type: ClusterIP
+ingress.yamlThis manifest defines the Ingress rule to expose your service to the public. It also includes the tls section for SSL.apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: capacity-iq-ui-ingress
+  namespace: ns-capacity-iq-d
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    # nginx.ingress.kubernetes.io/use-regex: "true"
+  labels:
+    app: capacity-iq-ui
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - capacity-iq-d.oneabbott.com
+      secretName: capacity-iq-d-tls-cert # Your SSL secret
+  rules:
+    - host: capacity-iq-d.oneabbott.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: capacity-iq-ui-service
+                port:
+                  number: 80
+hpa.yamlThis manifest creates a HorizontalPodAutoscaler to automatically scale your deployment based on CPU usage.apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: capacity-iq-ui-hpa
+  namespace: ns-capacity-iq-d
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: capacity-iq-ui-deployment
+  minReplicas: 1 # Minimum number of pods to run
+  maxReplicas: 2 # Maximum number of pods to scale up to
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 80 # Target CPU usage percentage
+serviceaccount.yamlThis manifest defines a ServiceAccount for your deployment to use.apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: capacity-iq-ui-sa
+  namespace: ns-capacity-iq-d
+Step 6: Implement SSL (TLS)This section shows you how to convert your .pfx certificate and create a Kubernetes secret from it. Make sure you're using Git Bash as it has openssl installed by default.Extract the Certificate and Key: Use openssl to extract the .crt and .key files from your .pfx file. The .key file is generated unencrypted so it can be used by Kubernetes.# Extract the combined cert and key into an unencrypted PEM file
+openssl pkcs12 -in your-cert.pfx -out combined.pem -nodes
+
+# Extract just the key from the combined PEM file
+openssl rsa -in combined.pem -out your-domain.key.pem
+
+# Extract the cert from the combined PEM file
+openssl x509 -in combined.pem -out your-domain.crt.pem
+Create the Kubernetes Secret: Use the kubectl command to create the TLS secret from the files you just extracted.# This command creates a secret of type kubernetes.io/tls
+# The --cert and --key flags point to the files you created
+kubectl create secret tls capacity-iq-d-tls-cert --cert=your-domain.crt.pem --key=your-domain.crt.pem --namespace=ns-capacity-iq-d
+This secret can then be referenced in your ingress.yaml file as shown in the example above.
