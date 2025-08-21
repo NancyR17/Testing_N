@@ -1,0 +1,31 @@
+This guide provides a comprehensive, step-by-step walkthrough for the containerization and deployment of the backend microservices (Web API and ETL Client) for the Capacity IQ project. It covers the entire process from initial repository cloning to final deployment on Kubernetes.1. Repository Clone and Local Environment SetupThis section details the initial setup required on your local machine to begin the process.Clone the Repository:Begin by cloning the backend project repository from Bitbucket using the following command.git clone <backend_repo_url>
+Set Up Java and Maven:Ensure the correct versions of Java and Maven are installed on your machine. Validate that the environment variables JAVA_HOME and M2_HOME are correctly configured and added to your system's PATH.2. Maven ConfigurationThis step is crucial for configuring Maven to correctly handle dependency resolution, especially within the corporate network.Configure Abbott Proxy in settings.xml:To allow Maven to access remote repositories, you must configure the corporate proxy. Navigate to the ~/.m2/ directory and edit the settings.xml file to include the proxy details.<proxies>
+    <proxy>
+        <id>Abbott-Proxy</id>
+        <active>true</active>
+        <protocol>http</protocol>
+        <host>your-proxy-url</host>
+        <port>your-port</port>
+        <username>your-username</username>
+        <password>your-password</password>
+    </proxy>
+</proxies>
+3. Project BuildWith Maven configured, you can now build the entire project from the root folder.Execute mvn clean install:From the root directory of the backend project, run the following command. This will clean, compile, test, and package all microservice modules, creating .jar files in their respective target folders.cd /path/to/backend-project/
+mvn clean install
+4. Containerization of Each MicroserviceThis is where you'll build and push Docker images for each individual microservice.Author Dockerfiles:A Dockerfile was authored within the root directory of each microservice. This file specifies the steps to create a container image from the packaged .jar file.Build and Tag Images:Navigate to each microservice's directory and execute the following commands to build and tag the Docker images.# Navigate to the web-api directory
+cd ./web-api
+docker build -t <ACR_NAME>/<repo_name>/web-api:latest .
+docker push <ACR_NAME>/<repo_name>/web-api:latest
+
+# Navigate to the etl-client directory
+cd ../etl-client
+docker build -t <ACR_NAME>/<repo_name>/etl-client:latest .
+docker push <ACR_NAME>/<repo_name>/etl-client:latest
+5. Kubernetes Manifest CreationKubernetes manifests were created to define the desired state for each service on the cluster.deployment.yaml: Defines the desired number of pod replicas and specifies the container image to use.service.yaml: Exposes the application pods within the cluster for internal communication.ingress.yaml: Created specifically for the Web API to manage external access and routing. The ETL Client does not require an Ingress as it is not externally exposed.6. Deployment to KubernetesThe final step is to apply the Kubernetes manifests to deploy the services to the cluster.Deploy Each Microservice:Execute the following commands from the terminal to deploy each service to the Kubernetes cluster.# Deploy Web API
+kubectl apply -f web-api/manifests/deployment.yaml
+kubectl apply -f web-api/manifests/service.yaml
+kubectl apply -f web-api/manifests/ingress.yaml
+
+# Deploy ETL Client
+kubectl apply -f etl-client/manifests/deployment.yaml
+kubectl apply -f etl-client/manifests/service.yaml
