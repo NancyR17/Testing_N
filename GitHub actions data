@@ -1,0 +1,144 @@
+बहुत बढ़िया\! अब जबकि सभी लॉजिक और रिक्वायरमेंट्स क्लियर हैं, यहाँ आपके लिए **शुरुआत से लेकर अंत तक** हर चीज़ के लिए एक अंतिम, विस्तृत (comprehensive) और क्रमबद्ध (step-by-step) मार्गदर्शिका (guide) है।
+
+हम इस प्रक्रिया को तीन मुख्य चरणों में विभाजित करेंगे।
+
+-----
+
+## चरण 1: Git Mirroring और Access Keys का सेटअप
+
+यह सुनिश्चित करता है कि आपका Bitbucket कोड सुरक्षित रूप से GitHub पर sync हो जाए और GitHub Actions को Bitbucket तक पहुँचने की अनुमति मिल जाए।
+
+| Step | Action | Detail / Command |
+| :--- | :--- | :--- |
+| **1.1 GitHub Repo** | एक **नया, ख़ाली (empty)** GitHub repository बनाएँ। (कोई README या files initialize न करें)। | `github.com/new` |
+| **1.2 Mirror Clone** | Local machine पर Bitbucket repo को **mirror clone** करें। | `git clone --mirror <Bitbucket-Repo-URL>` |
+| **1.3 Push to GitHub** | Clone की गई directory (`<repo-name>.git`) में जाकर, कोड को GitHub पर push करें। | `cd <repo-name>.git` $\rightarrow$ `git remote add github <GitHub-Repo-URL>` $\rightarrow$ `git push --mirror github` |
+| **1.4 Generate SSH Key** | SSH key pair बनाएँ (पासवर्ड ख़ाली छोड़ दें)। | `ssh-keygen -t rsa -b 4096 -f ~/.ssh/github_sync_key` |
+| **1.5 Bitbucket Key** | **Public Key** (`github_sync_key.pub`) को Bitbucket में **Repository Settings** $\rightarrow$ **Access Keys** में **Read/Write** access के साथ add करें। | |
+| **1.6 GitHub Secret** | **Private Key** (`github_sync_key`) को GitHub mirror repo में **Settings** $\rightarrow$ **Secrets** $\rightarrow$ **Actions** में **`BITBUCKET_SSH_PRIVATE_KEY`** नाम से स्टोर करें। | |
+
+-----
+
+## चरण 2: GitHub Environment और Secrets का कॉन्फ़िगरेशन
+
+यह CI/CD pipeline के लिए आवश्यक सुरक्षित सेटिंग्स और वातावरण-आधारित अलगाव (isolation) को स्थापित करता है।
+
+| Step | Action | Detail |
+| :--- | :--- | :--- |
+| **2.1 Environments** | GitHub repo में **Settings** $\rightarrow$ **Environments** में जाएँ और तीन वातावरण बनाएँ: **`dev`**, **`qa`**, और **`prod`**। | |
+| **2.2 Protection** | **`qa`** और **`prod`** वातावरण में **Required Reviewers** on करें (manual deployment approval के लिए)। | **`dev`** वातावरण को खुला रखें (automatic deployment के लिए)। |
+| **2.3 K8s Secret** | **`K8S_CONFIG`** Secret बनाएँ और इसे **सभी तीनों Environments** (`dev`, `qa`, `prod`) में अपने single cluster kubeconfig file के साथ स्टोर करें। | |
+| **2.4 DB Secrets** | **`DB_URL`**, **`DB_USERNAME`**, और **`DB_PASSWORD`** secrets बनाएँ। | इन्हें **हर Environment** के अंदर जाकर **environment-specific values** के साथ स्टोर करें। (नाम हर जगह एक जैसा रहेगा, वैल्यू बदल जाएगी)। |
+| **2.5 Codebase Update** | `$application.properties$` फ़ाइल को codebase में update करें ताकि वह **placeholders** का उपयोग करे, न कि hardcoded values का। | Example: `spring.datasource.url=${DB_URL}` |
+
+-----
+
+## चरण 3: Workflows का निर्माण (Pipelines)
+
+GitHub mirror repository में `.github/workflows/` folder के अंदर ये तीन फ़ाइलें बनाएँ।
+
+### 3.1 Workflow 1: Sync Workflow (`.github/workflows/sync.yml`)
+
+यह Bitbucket और GitHub के बीच हर मिनट sync सुनिश्चित करता है।
+
+```yaml
+# ... (Use the final sync.yml content provided in previous responses)
+name: 🔄 Bitbucket to GitHub Sync (Every Minute)
+on:
+  schedule:
+    - cron: '* * * * *' 
+# ... [rest of the sync logic]
+```
+
+### 3.2 Workflow 2: Frontend (UI) Deploy (`.github/workflows/ui_deploy.yml`)
+
+Dev में automatic deployment और QA/Prod में manual deployment का Logic।
+
+```yaml
+name: 🌐 Frontend UI Deploy
+
+on:
+  push:
+    branches: [ master ] # Change to feature branch for testing
+    paths: [ 'ui/**' ]
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: 'Target Environment (qa or prod)'
+        required: true
+        type: choice
+        options: [ qa, prod ]
+
+jobs:
+  determine_target:
+    runs-on: ubuntu-latest
+    outputs:
+      env: ${{ steps.set_env.outputs.env }}
+    steps:
+      - id: set_env
+        run: |
+          # If push, set to dev. Else, use user input (qa/prod).
+          if [ "${{ github.event_name }}" == "push" ]; then
+            echo "env=dev" >> $GITHUB_OUTPUT
+          else
+            echo "env=${{ github.event.inputs.target_env }}" >> $GITHUB_OUTPUT
+          fi
+
+  ui_pipeline:
+    needs: determine_target
+    environment: ${{ needs.determine_target.outputs.env }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🚚 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 📦 Build UI
+        run: |
+          TARGET_ENV=${{ needs.determine_target.outputs.env }}
+          npm install
+          npm run build:${TARGET_ENV} # Runs dev, qa, or prod build script
+
+      # ... [Docker Build and Push steps] ...
+          
+      - name: 🚀 Deploy to K8s Namespace
+        uses: azure/k8s-set-context@v3
+        with:
+            kubeconfig: ${{ secrets.K8S_CONFIG }}
+            
+        - name: K8s Apply Manifests
+          run: |
+            NAMESPACE=${{ needs.determine_target.outputs.env }}
+            # Deploy using the correct namespace and manifest folder
+            kubectl apply -f k8s-manifests/${NAMESPACE}/ui-deployment.yaml -n ${NAMESPACE}
+```
+
+### 3.3 Workflow 3: Backend (Web API & ETL) Deploy (`.github/workflows/backend_deploy.yml`)
+
+यह UI workflow की तरह ही है लेकिन इसमें Java build, artifacts और configuration injection शामिल हैं।
+
+```yaml
+# ... (Use the final backend_deploy.yml logic, copying the determine_target job) ...
+
+jobs:
+  build_all:
+    # mvn clean install step (runs only once)
+    # Upload Artifacts (JARs, manifests)
+
+  web_api_deploy:
+    needs: build_all
+    environment: ${{ needs.determine_target.outputs.env }}
+    steps:
+      - name: 📥 Download Artifacts
+      - name: 🔄 Configure Properties (Web API)
+        run: |
+          # Inject DB_URL, DB_USERNAME, DB_PASSWORD from environment secrets
+          echo "spring.datasource.url=${{ secrets.DB_URL }}" >> web-api/src/main/resources/application.properties
+          # ... [Other injections] ...
+      - name: 🚀 Deploy Web API to K8s Namespace
+        run: |
+          NAMESPACE=${{ needs.determine_target.outputs.env }}
+          kubectl apply -f web-api/k8s-manifests/${NAMESPACE}/deployment.yaml -n ${NAMESPACE}
+
+  etl_client_deploy:
+    # ... (Same logic as web_api_deploy for ETL client) ...
+```
