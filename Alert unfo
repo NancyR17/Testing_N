@@ -1,0 +1,4 @@
+1. Development (Dev) Environment ke liye:
+"We are observing a noticeable increase in the memory usage trend in the Development environment over the last two days, which is currently being monitored for any potential impact on performance."
+
+The Production database shows a consistent organic data growth trend (current usage is approx $30 \text{ GB}$), however, with over $500 \text{ GB}$ of free space available, we confirm sufficient capacity for continued operation."
