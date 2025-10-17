@@ -1,0 +1,14 @@
+Analysis: The alert triggered was based on the Database Storage Used (Avg) metric for the resource $p1-ad-nxcub-pgd521 (current usage approximately 23.8 GB at the time of analysis). Review of the historical metric data confirms a consistent, day-over-day upward trend in storage consumption. This pattern indicates organic data growth within the database rather than an abnormal spike or issue.
+
+Action Taken:
+
+Verified the metric trend to confirm expected growth.
+Action Taken:
+
+Verified the metric trend to confirm expected growth.
+
+Adjusted the Azure Monitor Alert Threshold for the database storage usage metric.
+
+Previous Threshold: (Assumed to be below the current usage trend, causing false alerts.)
+
+New Threshold: Increased the threshold limit to a range of 30 GB to 60 GB to accommodate the anticipated data growth for the near future and prevent premature
